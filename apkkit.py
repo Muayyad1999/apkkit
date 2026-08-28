@@ -779,8 +779,9 @@ def cmd_hook(args):
         cmd = base + ["-n", target, "-l", script]
         info("attaching to running process by name")
     else:
-        cmd = base + ["-f", target, "-l", script, "--no-pause"]
+        cmd = base + ["-f", target, "-l", script]
         info("spawning package and injecting at startup")
+        info("(Frida 17 auto-resumes; if it sits at the prompt, type %resume)")
     print(dim("  (Ctrl+C / 'exit' to detach)\n"))
     run_live(cmd)
 
@@ -972,7 +973,7 @@ def _ensure_builtin_script(kind):
 # --------------------------------------------------------------------------- #
 SSL_BYPASS_JS = r"""/*
  * apkkit :: universal-ish Android SSL/TLS pinning bypass
- * Run:  frida -U -f <pkg> -l ssl-bypass.js --no-pause
+ * Run:  frida -U -f <pkg> -l ssl-bypass.js   (or via: apkkit hook <pkg> --builtin ssl)
  *   or (gadget):  frida -U Gadget -l ssl-bypass.js
  */
 setTimeout(function () {
@@ -1058,7 +1059,7 @@ setTimeout(function () {
 
 ROOT_BYPASS_JS = r"""/*
  * apkkit :: common Android root-detection bypass
- * Run:  frida -U -f <pkg> -l root-bypass.js --no-pause
+ * Run:  frida -U -f <pkg> -l root-bypass.js   (or via: apkkit hook <pkg> --builtin root)
  */
 setTimeout(function () {
   Java.perform(function () {
@@ -1111,7 +1112,7 @@ setTimeout(function () {
 TRACE_JS = r"""/*
  * apkkit :: quick method tracer.
  * Set TARGET_CLASS / TARGET_METHOD below (or hook a whole class).
- * Run:  frida -U -f <pkg> -l trace.js --no-pause
+ * Run:  frida -U -f <pkg> -l trace.js   (or via: apkkit hook <pkg> --builtin trace)
  */
 var TARGET_CLASS  = 'com.example.YourClass';   // <-- edit me
 var TARGET_METHOD = null;                       // null = trace ALL methods
