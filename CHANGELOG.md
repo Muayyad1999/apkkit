@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- `frida-server` now auto-downloads the matching version, pushes it, and starts it
+  on a rooted device (`--no-start`, `--stop`, `--version`).
+- `hook --builtin flutter-ssl` for Flutter BoringSSL bypass (guided NVISO setup).
+- `flow`: signs before install; falls back to a gadget build when reFlutter can't
+  patch the engine.
+
 ## 0.3
 - Interactive colored menu (run `apkkit` with no arguments) + full flag CLI.
 - Frida-gadget injection for unrooted devices (`gadget`, with `--nsc` and `--sign`).

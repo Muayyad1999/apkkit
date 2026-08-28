@@ -17,7 +17,7 @@ Device / build:
 
 Dynamic instrumentation (the unrooted-friendly part):
     frida-ps      list apps/processes on the USB device
-    frida-server  download + push + start frida-server (ROOTED devices)
+    frida-server  auto download + push + start frida-server (ROOTED devices)
     hook          run a Frida script (spawn / attach / gadget)
     objection     launch an objection session (sslpinning off, explore, ...)
     scripts       drop ready-to-run Frida hook scripts to disk
@@ -54,6 +54,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
+import lzma
 import zipfile
 
 __version__ = "0.3"
@@ -62,6 +65,7 @@ HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
 DEFAULT_PULL_DIR = os.path.join(os.getcwd(), "pulled_apks")
 SCRIPTS_DIR = os.path.join(HOME, ".apkkit", "scripts")
+CACHE_DIR = os.path.join(HOME, ".apkkit", "cache")
 
 USER_APK_PREFIXES = ("/data/app/", "/mnt/expand/")
 
@@ -804,33 +808,90 @@ def cmd_objection(args):
     run_live(cmd)
 
 
+def _frida_version():
+    if not have("frida"):
+        return None
+    p = subprocess.run(["frida", "--version"], capture_output=True, text=True)
+    return (p.stdout or "").strip() or None
+
+
+def _download(url, dest):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "apkkit"})
+    with urllib.request.urlopen(req, timeout=90) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return dest
+
+
 def cmd_frida_server(args):
-    """ROOTED-device helper: download frida-server for the device ABI, push, run."""
-    if IS_WIN and not have("adb"):
+    """ROOTED-device helper: download the matching frida-server, push it, run it."""
+    if not have("adb"):
         need("adb")
     serial = resolve_serial(args)
+    dev_path = "/data/local/tmp/frida-server"
+
+    if args.stop:
+        hdr("Stopping frida-server on " + serial)
+        run_live(["adb", "-s", serial, "shell", "su", "-c", "pkill -f frida-server"])
+        ok("stop signal sent.")
+        return
+
     abi = device_abi(serial)
-    fmap = {"arm64-v8a": "arm64", "armeabi-v7a": "arm", "x86_64": "x86_64", "x86": "x86"}
-    farch = fmap.get(abi, "arm64")
-    hdr("frida-server setup (ROOTED only)")
-    warn("This pushes and runs frida-server as root. Unrooted device? Use `gadget` instead.")
-    ver = args.version
+    farch = {"arm64-v8a": "arm64", "armeabi-v7a": "arm",
+             "x86_64": "x86_64", "x86": "x86"}.get(abi, "arm64")
+    ver = args.version or _frida_version()
     if not ver:
-        if not have("frida"):
-            need("python-frida", "frida")
-        p = subprocess.run(["frida", "--version"], capture_output=True, text=True)
-        ver = (p.stdout or "").strip() or "16.0.0"
-    info("matching frida-server " + ver + " for " + abi + " (" + farch + ")")
-    print(dim("  Download the matching binary from:"))
-    print("    https://github.com/frida/frida/releases  ->  frida-server-" + ver + "-android-" + farch + ".xz")
-    print(dim("  Then, with the device rooted:"))
-    for line in [
-        "adb -s %s push frida-server /data/local/tmp/frida-server" % serial,
-        "adb -s %s shell \"su -c 'chmod 755 /data/local/tmp/frida-server'\"" % serial,
-        "adb -s %s shell \"su -c '/data/local/tmp/frida-server &'\"" % serial,
-    ]:
-        print("    " + line)
-    print(dim("  Verify from your PC: ") + "frida-ps -U")
+        need("python-frida", "frida")
+
+    hdr("frida-server " + ver + "  (" + abi + " -> " + farch + ")")
+    warn("ROOTED devices only - this runs frida-server as root. Unrooted? use `gadget`.")
+
+    name = "frida-server-" + ver + "-android-" + farch
+    cached = os.path.join(CACHE_DIR, name)
+    if os.path.isfile(cached):
+        info("using cached binary: " + cached)
+    else:
+        url = ("https://github.com/frida/frida/releases/download/" + ver + "/" + name + ".xz")
+        info("downloading " + url)
+        xz = cached + ".xz"
+        try:
+            _download(url, xz)
+        except Exception as e:
+            erro("download failed: " + str(e))
+            print(dim("  Get it manually from https://github.com/frida/frida/releases,"))
+            print(dim("  decompress the .xz, and save the binary as: " + cached))
+            return
+        info("decompressing ...")
+        try:
+            with lzma.open(xz) as fin, open(cached, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            os.remove(xz)
+        except Exception as e:
+            return erro("decompress failed: " + str(e))
+        ok("cached: " + cached)
+
+    info("pushing to " + dev_path + " ...")
+    if run_live(["adb", "-s", serial, "push", cached, dev_path]) != 0:
+        return erro("push failed.")
+    run_live(["adb", "-s", serial, "shell", "su", "-c", "chmod 755 " + dev_path])
+
+    if args.no_start:
+        ok("installed (not started). Start later with: apkkit frida-server")
+        return
+
+    info("starting frida-server as root (background) ...")
+    try:
+        subprocess.Popen(["adb", "-s", serial, "shell",
+                          "su -c 'nohup " + dev_path + " >/dev/null 2>&1 &'"])
+    except Exception as e:
+        return erro("failed to launch: " + str(e))
+    time.sleep(2)
+    info("verifying with frida-ps -U ...")
+    rc = run_live(["frida-ps", "-U"])
+    if rc == 0:
+        ok("frida-server is up. Attach: apkkit hook <pkg> -l <script.js>")
+    else:
+        warn("couldn't confirm - check: adb shell su -c \"ps -A | grep frida\"")
 
 
 def cmd_sign(args):
@@ -1885,8 +1946,11 @@ def build_parser():
     sp.add_argument("--all", action="store_true", help="all processes (-U)")
     sp.set_defaults(func=cmd_frida_ps)
 
-    sp = add("frida-server", "download/push/start frida-server (ROOTED devices)")
-    sp.add_argument("--version"); sp.set_defaults(func=cmd_frida_server)
+    sp = add("frida-server", "download + push + start frida-server (ROOTED devices)")
+    sp.add_argument("--version", help="frida-server version (default: your local frida version)")
+    sp.add_argument("--no-start", action="store_true", help="install but don't launch it")
+    sp.add_argument("--stop", action="store_true", help="stop a running frida-server")
+    sp.set_defaults(func=cmd_frida_server)
 
     sp = add("hook", "run a Frida script (spawn / attach / gadget)")
     sp.add_argument("target", help="package name, process name, or 'Gadget'")
