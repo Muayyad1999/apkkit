@@ -38,7 +38,7 @@ Housekeeping:
 Unrooted quick start (MITM a pinned app):
     apkkit gadget app.apk --arch auto --nsc     # inject gadget + trust user CAs
     apkkit install app.objection.apk
-    apkkit hook Gadget --builtin ssl            # or: apkkit objection -g Gadget --sslpinning
+    apkkit hook Gadget --gadget --builtin ssl   # or: apkkit objection -g Gadget --sslpinning
 
 Run `apkkit doctor` for tool status. Nothing is required until you run a command
 that needs it - and if it's missing, apkkit tells you exactly how to get it.
@@ -737,7 +737,7 @@ def cmd_gadget(args):
             print(dim("  If install fails with a certificate error, run: ") + "apkkit sign " + _quote(out))
         print(dim("\n  The app PAUSES on launch until you attach Frida.\n  Next:"))
         print("    apkkit install " + _quote(install_target))
-        print("    apkkit hook Gadget --builtin ssl")
+        print("    apkkit hook Gadget --gadget --builtin ssl")
         print("    apkkit objection -g Gadget --sslpinning")
     else:
         erro("objection patchapk exited " + str(rc) + " - no output apk.")
@@ -893,7 +893,7 @@ def _ensure_builtin_script(kind):
         print("   1) Download " + bold("disable-flutter-tls.js") + " from")
         print("      https://github.com/NVISOsecurity/disable-flutter-tls-verification")
         print("   2) Save it to: " + SCRIPTS_DIR)
-        print("   3) Re-run:  apkkit hook Gadget --builtin flutter-ssl")
+        print("   3) Re-run:  apkkit hook Gadget --gadget --builtin flutter-ssl")
         sys.exit(1)
     fname = {"ssl": "ssl-bypass.js", "root": "root-bypass.js", "trace": "trace.js"}.get(kind)
     if not fname:
@@ -1606,7 +1606,7 @@ def cmd_flow(args):
     hdr("Flow complete")
     print("  final apk: " + bold(final))
     if method in ("gadget", "gadget-fallback"):
-        print(dim("  Attach Frida: ") + "apkkit hook Gadget --builtin ssl")
+        print(dim("  Attach Frida: ") + "apkkit hook Gadget --gadget --builtin ssl")
         if method == "gadget-fallback":
             print(dim("  (Flutter app: for TRAFFIC you need a Flutter TLS bypass, not the Java ssl script.)"))
     elif method == "reflutter":
@@ -1767,7 +1767,7 @@ def cmd_blutter(args):
             warn("blutter exited " + str(rc) + " but the full output is written - fine.")
         ok("done. Output in " + outdir)
         print(dim("  Dart method hooks: ") + frida_js)
-        print(dim("  Run them: ") + "apkkit hook <pkg-or-Gadget> -l " + _quote(frida_js))
+        print(dim("  Run them: ") + "apkkit hook Gadget --gadget -l " + _quote(frida_js))
         print(dim("  Also see: ") + "asm/ (disassembly), pp.txt / objs.txt (object pool)")
     elif other:
         warn("blutter crashed on the Frida-script step (exit " + str(rc) +
