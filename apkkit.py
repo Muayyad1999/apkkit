@@ -883,9 +883,21 @@ def cmd_scripts(args):
 
 
 def _ensure_builtin_script(kind):
+    if kind == "flutter-ssl":
+        for cand in (os.path.join(SCRIPTS_DIR, "disable-flutter-tls.js"),
+                     os.path.join(os.getcwd(), "disable-flutter-tls.js")):
+            if os.path.isfile(cand):
+                return cand
+        erro("Flutter TLS-bypass script not found (it's a maintained community script, not bundled).")
+        print(dim("  Flutter uses BoringSSL - the normal 'ssl' script won't work. Instead:"))
+        print("   1) Download " + bold("disable-flutter-tls.js") + " from")
+        print("      https://github.com/NVISOsecurity/disable-flutter-tls-verification")
+        print("   2) Save it to: " + SCRIPTS_DIR)
+        print("   3) Re-run:  apkkit hook Gadget --builtin flutter-ssl")
+        sys.exit(1)
     fname = {"ssl": "ssl-bypass.js", "root": "root-bypass.js", "trace": "trace.js"}.get(kind)
     if not fname:
-        die("Unknown built-in '" + kind + "'. Choose: ssl | root | trace.")
+        die("Unknown built-in '" + kind + "'. Choose: ssl | root | trace | flutter-ssl.")
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     path = os.path.join(SCRIPTS_DIR, fname)
     if not os.path.isfile(path):
@@ -1879,7 +1891,8 @@ def build_parser():
     sp = add("hook", "run a Frida script (spawn / attach / gadget)")
     sp.add_argument("target", help="package name, process name, or 'Gadget'")
     sp.add_argument("-l", "--script", help="path to a Frida JS script")
-    sp.add_argument("--builtin", choices=["ssl", "root", "trace"], help="use a bundled script")
+    sp.add_argument("--builtin", choices=["ssl", "root", "trace", "flutter-ssl"],
+                    help="bundled script (flutter-ssl = Flutter BoringSSL bypass, needs the NVISO script)")
     sp.add_argument("--attach", action="store_true", help="attach by process name (-n)")
     sp.add_argument("--gadget", action="store_true", help="attach to a gadget-patched app")
     sp.set_defaults(func=cmd_hook)
@@ -2122,9 +2135,10 @@ def submenu(fn):
 def pick_script():
     """Let the user choose a Frida script: built-ins + anything in SCRIPTS_DIR."""
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    builtins = [("ssl", "universal SSL pinning bypass"),
+    builtins = [("ssl", "universal SSL pinning bypass (Java/OkHttp)"),
                 ("root", "root-detection bypass"),
-                ("trace", "method tracer (edit target)")]
+                ("trace", "method tracer (edit target)"),
+                ("flutter-ssl", "Flutter BoringSSL bypass (needs NVISO script)")]
     customs = sorted(f for f in os.listdir(SCRIPTS_DIR)
                      if f.endswith(".js") and f not in BUILTIN_SCRIPTS)
     print()
