@@ -1462,6 +1462,27 @@ def cmd_config(args):
 # --------------------------------------------------------------------------- #
 # commands: flow
 # --------------------------------------------------------------------------- #
+def _flow_gadget(merged, serial, no_nsc):
+    """Inject the Frida gadget and return a signed, installable apk path."""
+    if not have("objection"):
+        need("objection")
+    cmd = ["objection", "patchapk", "-s", merged, "-a", device_abi(serial)]
+    if not no_nsc:
+        cmd.append("-N")
+    run_live(cmd)
+    cand = _base(merged) + ".objection.apk"
+    if not os.path.isfile(cand):
+        warn("no *.objection.apk produced; using merged apk.")
+        return merged
+    ok("gadget injected: " + cand)
+    if resolve_uber():
+        cmd_sign(A(apk=cand, keystore=None))
+        signed = _base(cand) + "-aligned-debugSigned.apk"
+        if os.path.isfile(signed):
+            return signed
+    return cand
+
+
 def cmd_flow(args):
     serial = resolve_serial(args)
     pkg = args.package
@@ -1513,23 +1534,7 @@ def cmd_flow(args):
              "use reFlutter for traffic.")
 
     if method == "gadget":
-        if not have("objection"):
-            need("objection")
-        cmd = ["objection", "patchapk", "-s", merged, "-a", device_abi(serial)]
-        if not args.no_nsc:
-            cmd.append("-N")
-        run_live(cmd)
-        cand = _base(merged) + ".objection.apk"
-        if os.path.isfile(cand):
-            final = cand
-            ok("gadget injected: " + cand)
-            if resolve_uber():          # guarantee a valid signature
-                cmd_sign(A(apk=cand, keystore=None))
-                signed = _base(cand) + "-aligned-debugSigned.apk"
-                if os.path.isfile(signed):
-                    final = signed
-        else:
-            warn("no *.objection.apk produced; using merged apk.")
+        final = _flow_gadget(merged, serial, args.no_nsc)
     elif method == "reflutter":
         if not have("reflutter"):
             warn("reflutter not installed - skipping patch.")
@@ -1548,7 +1553,11 @@ def cmd_flow(args):
                 if os.path.isfile(signed):
                     final = signed
             else:
-                warn("no release.RE.apk produced.")
+                warn("reFlutter can't patch this app's engine (unsupported/debug snapshot).")
+                info("falling back to Frida gadget so you still get an instrumentable build.")
+                info("for traffic you'll need a Flutter TLS bypass - see the notes after this run.")
+                final = _flow_gadget(merged, serial, args.no_nsc)
+                method = "gadget-fallback"
     elif method == "none":
         info("skipping patch (--no-patch).")
     else:
@@ -1563,6 +1572,18 @@ def cmd_flow(args):
                 final = cand
                 ok("patched: " + cand)
 
+    # never try to install an unsigned apk (raw APKEditor output won't verify)
+    if args.install and not (final.endswith("Signed.apk") or final.endswith("-patched.apk")):
+        if resolve_uber():
+            info("signing the apk before install ...")
+            cmd_sign(A(apk=final, keystore=None))
+            s = _base(final) + "-aligned-debugSigned.apk"
+            if os.path.isfile(s):
+                final = s
+        else:
+            warn("apk is unsigned and uber-apk-signer isn't set - install may fail. "
+                 "Run: apkkit config --uber <path>")
+
     if args.install:
         step(total, total, "Install")
         adb(["uninstall", pkg], serial=serial)
@@ -1572,8 +1593,10 @@ def cmd_flow(args):
 
     hdr("Flow complete")
     print("  final apk: " + bold(final))
-    if method == "gadget":
+    if method in ("gadget", "gadget-fallback"):
         print(dim("  Attach Frida: ") + "apkkit hook Gadget --builtin ssl")
+        if method == "gadget-fallback":
+            print(dim("  (Flutter app: for TRAFFIC you need a Flutter TLS bypass, not the Java ssl script.)"))
     elif method == "reflutter":
         print(dim("  Set the device proxy to <your-ip>:8083 and watch traffic in Burp."))
 
