@@ -1,0 +1,27 @@
+# apkkit working output
+pulled_apks/
+*.blutter/
+*.apk
+*.xapk
+*.apks
+*.objection.apk
+*-patched.apk
+*-merged.apk
+*.RE.apk
+*-aligned-*Signed.apk
+
+# apkkit local state (do not commit tool paths / scripts cache)
+.apkkit.json
+.apkkit/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,11 @@
+# apkkit itself needs ONLY the Python standard library (Python 3.8+).
+# There is nothing to `pip install` for apkkit to run.
+#
+# The commands below drive external tools. Install the ones you need:
+#
+#   pip install frida-tools      # frida, frida-ps        -> hook, frida-ps
+#   pip install objection        # gadget inject, explore -> gadget, objection
+#   pip install reflutter        # Flutter MITM           -> reflutter
+#
+# Non-pip tools (see README): adb (platform-tools), java, APKEditor.jar,
+# apktool, jadx, aapt/aapt2, uber-apk-signer, and Blutter.
