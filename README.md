@@ -100,11 +100,13 @@ apkkit needs nothing to *run*, but its commands drive standard RE tools. Run
 ## Command reference
 
 ```
-Device/build : devices  list  pull  merge  patch  gadget  sign  install  uninstall  proxy  cert  flow
+Device/build : devices  list  pull  merge  patch  gadget  sign  install  uninstall  proxy  cert  flow  mitm
 Instrument   : frida-ps  frida-server  hook  objection  scripts
 Flutter      : blutter  reflutter
 Inspect      : info  libs  strings  scan  decode  decompile
-Housekeeping : doctor  config  menu
+Diagnostics  : logcat  checks  batch  emulator
+Instrument   : frida-ps  frida-server  hook  objection  scripts
+Housekeeping : doctor  config  update  menu
 ```
 
 Run `apkkit <command> -h` for options. Highlights:

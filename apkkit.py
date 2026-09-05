@@ -19,7 +19,7 @@ Device / build:
 
 Dynamic instrumentation (the unrooted-friendly part):
     frida-ps      list apps/processes on the USB device
-    frida-server  auto download + push + start frida-server (ROOTED devices)
+    frida-server  auto download + push + start frida-server (ROOTED devices; --port/--stealth)
     hook          run a Frida script (spawn / attach / gadget)
     objection     launch an objection session (sslpinning off, explore, ...)
     scripts       drop ready-to-run Frida hook scripts to disk
@@ -34,6 +34,12 @@ Inspection (offline, just point at an .apk):
 
 Housekeeping:
     devices   list attached devices
+    logcat    stream filtered logcat (why does an app self-close?)
+    checks    find root/emulator/tamper checks in smali (+--neutralize)
+    mitm      one-shot pull->patch->install->cert->proxy->launch
+    emulator  list / launch AVDs with RE-friendly flags
+    batch     classify / libs / scan across all pulled apps
+    update    self-update via git pull
     doctor    check external tools + show how to install missing ones
     config    show / set saved tool paths (~/.apkkit.json)
 
@@ -62,7 +68,7 @@ import urllib.request
 import lzma
 import zipfile
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
@@ -738,6 +744,12 @@ def cmd_cert(args):
         run_live(["adb", "-s", serial, "push", local, "/sdcard/" + name + ".crt"])
         print(dim("  On device: Settings > Security > Install a certificate > CA cert > pick /sdcard/" + name + ".crt"))
 
+    if args.reboot:
+        info("rebooting device so the trust store is re-read ...")
+        run_live(["adb", "-s", serial, "reboot"])
+        run_live(["adb", "-s", serial, "wait-for-device"])
+        ok("device back up.")
+
 
 def cmd_proxy(args):
     """Point the device's traffic at your Burp/Fiddler proxy (and optionally
@@ -1014,11 +1026,18 @@ def cmd_frida_server(args):
     if not have("adb"):
         need("adb")
     serial = resolve_serial(args)
-    dev_path = "/data/local/tmp/frida-server"
+    import random
+    devname = "frida-server"
+    port = args.port
+    if args.stealth:
+        devname = "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(8))
+        port = port or random.randint(20000, 60000)
+        info("stealth: binary '" + devname + "', port " + str(port))
+    dev_path = "/data/local/tmp/" + devname
 
     if args.stop:
         hdr("Stopping frida-server on " + serial)
-        run_live(_su(serial, "pkill -f frida-server"))
+        run_live(_su(serial, "pkill -f frida-server; pkill -f /data/local/tmp/" + devname))
         ok("stop signal sent.")
         return
 
@@ -1065,18 +1084,28 @@ def cmd_frida_server(args):
         ok("installed (not started). Start later with: apkkit frida-server")
         return
 
+    listen = (" -l 0.0.0.0:" + str(port)) if port else ""
     info("starting frida-server as root (background) ...")
     try:
-        subprocess.Popen(_su(serial, "nohup " + dev_path + " >/dev/null 2>&1 &"))
+        subprocess.Popen(_su(serial, "nohup " + dev_path + listen + " >/dev/null 2>&1 &"))
     except Exception as e:
         return erro("failed to launch: " + str(e))
     time.sleep(2)
-    info("verifying with frida-ps -U ...")
-    rc = run_live(["frida-ps", "-U"])
-    if rc == 0:
-        ok("frida-server is up. Attach: apkkit hook <pkg> -l <script.js>")
+    if port:
+        run_live(["adb", "-s", serial, "forward", "tcp:" + str(port), "tcp:" + str(port)])
+        info("verifying with frida-ps -H 127.0.0.1:" + str(port) + " ...")
+        rc = run_live(["frida-ps", "-H", "127.0.0.1:" + str(port)])
+        if rc == 0:
+            ok("up on port " + str(port) + ". Attach with: frida -H 127.0.0.1:" + str(port) + " -f <pkg> -l <script>")
+        else:
+            warn("couldn't confirm - check: adb shell su -c \"ps -A | grep " + devname + "\"")
     else:
-        warn("couldn't confirm - check: adb shell su -c \"ps -A | grep frida\"")
+        info("verifying with frida-ps -D " + serial + " ...")
+        rc = run_live(["frida-ps", "-D", serial])
+        if rc == 0:
+            ok("frida-server is up. Attach: apkkit hook <pkg> -l <script.js>")
+        else:
+            warn("couldn't confirm - check: adb shell su -c \"ps -A | grep frida\"")
 
 
 def _sign(apk, keystore=None):
@@ -1158,9 +1187,10 @@ def _ensure_builtin_script(kind):
         print("   2) Save it to: " + SCRIPTS_DIR)
         print("   3) Re-run:  apkkit hook Gadget --gadget --builtin flutter-ssl")
         sys.exit(1)
-    fname = {"ssl": "ssl-bypass.js", "root": "root-bypass.js", "trace": "trace.js"}.get(kind)
+    fname = {"ssl": "ssl-bypass.js", "root": "root-bypass.js", "trace": "trace.js",
+             "webview": "webview.js", "sqlite": "sqlite.js", "crypto": "crypto.js"}.get(kind)
     if not fname:
-        die("Unknown built-in '" + kind + "'. Choose: ssl | root | trace | flutter-ssl.")
+        die("Unknown built-in '" + kind + "'. Choose: ssl|root|trace|flutter-ssl|webview|sqlite|crypto.")
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     path = os.path.join(SCRIPTS_DIR, fname)
     if not os.path.isfile(path):
@@ -1347,15 +1377,92 @@ setTimeout(function () {
 }, 0);
 """
 
+WEBVIEW_JS = r"""/* apkkit :: WebView inspector - logs URLs, JS bridges, enables debugging */
+setTimeout(function () { Java.perform(function () {
+  var WV = Java.use('android.webkit.WebView');
+  try { WV.setWebContentsDebuggingEnabled(true);
+        console.log('[wv] WebContents debugging enabled (chrome://inspect)'); } catch (e) {}
+  ['loadUrl'].forEach(function (m) {
+    WV[m].overloads.forEach(function (ov) {
+      ov.implementation = function () {
+        console.log('[wv] loadUrl: ' + arguments[0]); return ov.apply(this, arguments);
+      };
+    });
+  });
+  try {
+    WV.addJavascriptInterface.implementation = function (obj, name) {
+      console.log('[wv] addJavascriptInterface: ' + name + ' -> ' + obj.$className);
+      return this.addJavascriptInterface(obj, name);
+    };
+  } catch (e) {}
+  try {
+    WV.evaluateJavascript.overload('java.lang.String', 'android.webkit.ValueCallback')
+      .implementation = function (js, cb) {
+        console.log('[wv] evaluateJavascript: ' + (js.length > 160 ? js.substr(0,160)+'...' : js));
+        return this.evaluateJavascript(js, cb);
+      };
+  } catch (e) {}
+  console.log('[wv] WebView hooks installed.');
+}); }, 0);
+"""
+
+SQLITE_JS = r"""/* apkkit :: SQLite logger - dumps SQL statements + queries */
+setTimeout(function () { Java.perform(function () {
+  var DB = Java.use('android.database.sqlite.SQLiteDatabase');
+  ['execSQL', 'rawQuery', 'query'].forEach(function (m) {
+    if (!DB[m]) return;
+    DB[m].overloads.forEach(function (ov) {
+      ov.implementation = function () {
+        var a = [].slice.call(arguments).map(String).join(' | ');
+        console.log('[sql] ' + m + ': ' + (a.length > 300 ? a.substr(0,300)+'...' : a));
+        return ov.apply(this, arguments);
+      };
+    });
+  });
+  console.log('[sql] SQLite hooks installed.');
+}); }, 0);
+"""
+
+CRYPTO_JS = r"""/* apkkit :: crypto monitor - logs Cipher / Mac / MessageDigest input+output */
+setTimeout(function () { Java.perform(function () {
+  function b64(bytes) {
+    try { return Java.use('android.util.Base64').encodeToString(bytes, 2); } catch (e) { return '<'+bytes.length+' bytes>'; }
+  }
+  try {
+    var Cipher = Java.use('javax.crypto.Cipher');
+    Cipher.doFinal.overload('[B').implementation = function (data) {
+      var out = this.doFinal(data);
+      console.log('[crypto] Cipher(' + this.getAlgorithm() + ')\n  in : ' + b64(data) + '\n  out: ' + b64(out));
+      return out;
+    };
+  } catch (e) {}
+  try {
+    var MD = Java.use('java.security.MessageDigest');
+    MD.digest.overload('[B').implementation = function (data) {
+      var out = this.digest(data);
+      console.log('[crypto] ' + this.getAlgorithm() + '(' + b64(data) + ') = ' + b64(out));
+      return out;
+    };
+  } catch (e) {}
+  console.log('[crypto] crypto hooks installed.');
+}); }, 0);
+"""
+
 BUILTIN_SCRIPTS = {
     "ssl-bypass.js": SSL_BYPASS_JS,
     "root-bypass.js": ROOT_BYPASS_JS,
     "trace.js": TRACE_JS,
+    "webview.js": WEBVIEW_JS,
+    "sqlite.js": SQLITE_JS,
+    "crypto.js": CRYPTO_JS,
 }
 BUILTIN_DESC = {
     "ssl-bypass.js": "universal SSL/TLS pinning bypass",
     "root-bypass.js": "common root-detection bypass",
     "trace.js": "method call tracer (edit target)",
+    "webview.js": "WebView URL / JS-bridge inspector",
+    "sqlite.js": "SQLite query logger",
+    "crypto.js": "Cipher / hash monitor",
 }
 
 
@@ -1677,7 +1784,6 @@ def _mitm_status():
 
 
 def cmd_doctor(args):
-    hdr("apkkit doctor")
     checks = [
         ("adb", have("adb"), "adb", "everything device-side"),
         ("java", have("java"), "java", "merge / gadget / sign"),
@@ -1694,6 +1800,11 @@ def cmd_doctor(args):
         ("blutter", resolve_blutter(), "blutter", "Flutter static analysis"),
         ("reflutter", have("reflutter"), "reflutter", "Flutter MITM patch"),
     ]
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({name: bool(found) for name, found, _, _ in checks}, indent=2))
+        return
+    hdr("apkkit doctor")
     w = max(len(c[0]) for c in checks)
     missing = []
     for name, found, key, needed in checks:
@@ -2311,6 +2422,287 @@ def cmd_flutter_patch(args):
     print(dim("  tamper detection - a TLS patch won't help; that check must be removed too."))
 
 
+# --------------------------------------------------------------------------- #
+# commands: diagnostics / analysis / orchestration (v0.4)
+# --------------------------------------------------------------------------- #
+DETECTION_REGEX = ("root|magisk|superuser|supersu|xposed|riru|zygisk|"
+                   "emulator|qemu|goldfish|ranchu|genymotion|sdk_gphone|"
+                   "integrity|safetynet|attest|droidguard|playintegrity|"
+                   "frida|gadget|27042|tamper|repackag|signature|debugger|"
+                   "SecurityException|finishAffinity|System\\.exit")
+
+
+def cmd_logcat(args):
+    """Stream filtered logcat for one package - great for finding why an app self-closes."""
+    if not have("adb"):
+        need("adb")
+    serial = resolve_serial(args)
+    if not args.no_clear:
+        adb(["logcat", "-c"], serial=serial)
+    pid = ""
+    if args.package:
+        _, out, _ = adb(["shell", "pidof", args.package], serial=serial)
+        pid = out.strip().split()[0] if out.strip() else ""
+    pat = None
+    if not args.all:
+        pat = re.compile(args.grep or DETECTION_REGEX, re.I)
+    hdr("logcat" + (" pid " + pid if pid else "") + (" ~ /" + (args.grep or "detection") + "/" if pat else ""))
+    if args.package and not pid:
+        info("app not running yet - launch it now; showing filtered full logcat.")
+    cmd = ["adb", "-s", serial, "logcat", "-v", "brief"]
+    if pid:
+        cmd += ["--pid", pid]
+    print(dim("  $ " + " ".join(cmd) + "   (Ctrl+C to stop)\n"))
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace", bufsize=1)
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            if pat is None:
+                print(line)
+            elif pat.search(line):
+                print(yel(line) if _COLOR else "! " + line)
+    except KeyboardInterrupt:
+        print("\n" + yel("  stopped."))
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+# smali patterns that usually mean "detect X then bail"
+CHECK_PATTERNS = [
+    ("root", r'"/system/(xbin|bin)/su"|"su"|magisk|Superuser|RootBeer|test-keys|which su'),
+    ("emulator", r'goldfish|ranchu|generic_x86|sdk_gphone|ro\.kernel\.qemu|"unknown"|Genymotion'),
+    ("signature/tamper", r'GET_SIGNATURES|getSignatures|signingInfo|GET_SIGNING_CERTIFICATES|PackageManager;->getPackageInfo'),
+    ("integrity", r'SafetyNet|DroidGuard|IntegrityManager|attest'),
+    ("frida", r'frida|gadget|re\.frida|LIBFRIDA|27042|linjector'),
+    ("debugger", r'isDebuggerConnected|waitingForDebugger|Debug;->'),
+    ("self-close", r'Ljava/lang/System;->exit|Ljava/lang/Runtime;->halt|Landroid/os/Process;->killProcess|->finishAffinity'),
+]
+
+# smali invoke lines that terminate the app - safe to strip (all return void)
+_KILL_RX = re.compile(
+    r'^\s*invoke-\w+\s*\{[^}]*\},\s*L'
+    r'(java/lang/System;->exit\(I\)V'
+    r'|java/lang/Runtime;->halt\(I\)V'
+    r'|android/os/Process;->killProcess\(I\)V'
+    r'|android/app/Activity;->finishAffinity\(\)V)')
+
+
+def cmd_checks(args):
+    """Decompile to smali and locate root/emulator/tamper/integrity self-checks.
+    With --neutralize, strip the self-kill calls (System.exit/killProcess/...) and rebuild."""
+    if not have("apktool"):
+        need("apktool")
+    apk = args.apk
+    if not os.path.isfile(apk):
+        die("Not found: " + apk)
+    decoded = args.decoded or (_base(apk) + ".decoded")
+    if not os.path.isdir(decoded):
+        hdr("apktool decode -> " + decoded)
+        if run_live(["apktool", "d", apk, "-o", decoded, "-f"]) != 0:
+            die("apktool decode failed.")
+    else:
+        info("using existing decode: " + decoded)
+
+    smali_files = []
+    for root, _, files in os.walk(decoded):
+        for f in files:
+            if f.endswith(".smali"):
+                smali_files.append(os.path.join(root, f))
+
+    hdr("Anti-analysis checks in " + os.path.basename(apk) + "  (" + str(len(smali_files)) + " smali files)")
+    compiled = [(label, re.compile(rx, re.I)) for label, rx in CHECK_PATTERNS]
+    hits = {label: [] for label, _ in CHECK_PATTERNS}
+    for path in smali_files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for i, line in enumerate(fh, 1):
+                    for label, rx in compiled:
+                        if rx.search(line):
+                            hits[label].append((path, i, line.strip()))
+        except Exception:
+            continue
+
+    rel = lambda p: os.path.relpath(p, decoded)
+    any_hit = False
+    for label, _ in CHECK_PATTERNS:
+        rows = hits[label]
+        if not rows:
+            continue
+        any_hit = True
+        print("\n  " + bold(mag(label)) + dim("  (" + str(len(rows)) + " hits)"))
+        for path, ln, txt in rows[: args.show]:
+            print("    " + rel(path) + ":" + str(ln) + dim("  " + (txt[:90])))
+        if len(rows) > args.show:
+            print(dim("    ... " + str(len(rows) - args.show) + " more (raise --show)"))
+    if not any_hit:
+        print("  " + dim("No obvious checks found in smali (native check, or packed)."))
+
+    if args.neutralize:
+        hdr("Neutralizing self-kill calls (System.exit / killProcess / halt / finishAffinity)")
+        patched = 0
+        for path in smali_files:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+            except Exception:
+                continue
+            changed = False
+            for i, line in enumerate(lines):
+                if _KILL_RX.match(line):
+                    lines[i] = "    # apkkit-neutralized: " + line.lstrip()
+                    changed = True
+                    patched += 1
+            if changed:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.writelines(lines)
+        ok("commented out " + str(patched) + " self-kill call(s).")
+        if not patched:
+            warn("nothing to neutralize (the check may exit via native code or a different API).")
+        out = _base(apk) + "-nokill.apk"
+        info("rebuilding with apktool ...")
+        if run_live(["apktool", "b", decoded, "-o", out]) != 0:
+            die("apktool build failed.")
+        signed = _sign(out)
+        final = signed or out
+        ok("built: " + final)
+        print(dim("  Install it: apkkit install " + _quote(final)))
+        print(dim("  Best-effort - if the app still bails, the check kills via native code or"))
+        print(dim("  a path this doesn't cover; inspect the hits above and patch the method."))
+
+
+def cmd_mitm(args):
+    """One-shot: pull -> merge -> patch -> install -> trust CA -> set proxy -> launch."""
+    serial = resolve_serial(args)
+    pkg = args.package
+    hdr("MITM setup for " + pkg)
+    # reuse the flow to pull/merge/patch/install
+    cmd_flow(A(package=pkg, serial=serial, out=None, method=args.method or "auto",
+               gadget=False, no_patch=False, no_nsc=False, install=True, grant=True))
+    if args.cert:
+        cmd_cert(A(cert=args.cert, user=False, serial=serial))
+    if args.proxy:
+        cmd_proxy(A(target=args.proxy, transparent=args.transparent, serial=serial))
+    if args.launch:
+        info("launching " + pkg + " ...")
+        run_live(["adb", "-s", serial, "shell", "monkey", "-p", pkg,
+                  "-c", "android.intent.category.LAUNCHER", "1"])
+    hdr("MITM ready")
+    print("  Watch requests in Burp/Fiddler. Reset later with: apkkit mitm " + pkg + " --off")
+
+
+def cmd_mitm_off(serial, pkg):
+    hdr("MITM teardown for " + pkg)
+    cmd_proxy(A(target="off", serial=serial))
+    run_live(["adb", "-s", serial, "uninstall", pkg])
+    ok("proxy cleared + app uninstalled.")
+
+
+def _resolve_emulator():
+    p = have("emulator")
+    if p:
+        return p
+    for g in (os.path.join(os.environ.get("ANDROID_HOME", ""), "emulator", "emulator"),
+              os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk", "emulator", "emulator.exe"),
+              os.path.join(HOME, "Android", "Sdk", "emulator", "emulator")):
+        if g and os.path.isfile(g):
+            return g
+    return None
+
+
+def cmd_emulator(args):
+    """List AVDs, or launch one with RE-friendly flags (writable system, proxy, cold boot)."""
+    emu = _resolve_emulator()
+    if not emu:
+        erro("'emulator' not found. It's in <android-sdk>/emulator.")
+        print(dim("  Add that folder to PATH, or set ANDROID_HOME."))
+        return
+    if not args.name:
+        hdr("Available AVDs")
+        run_live([emu, "-list-avds"])
+        print(dim("\n  Launch: apkkit emulator <name> [--writable-system] [--proxy ip:port] [--cold]"))
+        return
+    hdr("Launching AVD: " + args.name)
+    cmd = [emu, "-avd", args.name]
+    if args.writable_system:
+        cmd.append("-writable-system")
+    if args.cold:
+        cmd += ["-no-snapshot-load"]
+    if args.proxy:
+        cmd += ["-http-proxy", "http://" + args.proxy]
+    if args.extra:
+        cmd += args.extra.split()
+    info("starting (detached) ...")
+    print(dim("  $ " + " ".join(cmd)))
+    try:
+        subprocess.Popen(cmd)
+        ok("emulator starting. Give it a moment, then: apkkit devices")
+    except Exception as e:
+        erro("failed to launch: " + str(e))
+
+
+def cmd_batch(args):
+    """Run an inspection across every app folder / apk under a directory."""
+    root = args.dir or DEFAULT_PULL_DIR
+    if not os.path.isdir(root):
+        die("Not a directory: " + root + "  (pull some apps first, or pass --dir)")
+    targets = []
+    for name in sorted(os.listdir(root)):
+        p = os.path.join(root, name)
+        if os.path.isdir(p) and glob.glob(os.path.join(p, "*.apk")):
+            targets.append(p)
+        elif p.lower().endswith(".apk"):
+            targets.append(p)
+    if not targets:
+        die("No apk folders or files under " + root)
+    hdr(args.action + " across " + str(len(targets)) + " target(s) in " + root)
+
+    if args.action == "classify":
+        w = max(len(os.path.basename(t.rstrip("/\\"))) for t in targets)
+        for t in targets:
+            try:
+                members, _ = _apk_members(t)
+                names = [n for n, _ in members]
+                flut = any(n.endswith("libflutter.so") or n.startswith("assets/flutter_assets/") for n in names)
+                abis = sorted({n.split("/")[1] for n in names if n.startswith("lib/") and n.count("/") >= 2})
+                tag = mag("FLUTTER") if flut else grn("native ")
+                print("  " + os.path.basename(t.rstrip("/\\")).ljust(w) + "  " + tag +
+                      dim("  " + (",".join(abis) or "no-abi")))
+            except SystemExit:
+                print("  " + os.path.basename(t.rstrip("/\\")).ljust(w) + "  " + red("(unreadable)"))
+        return
+
+    for t in targets:
+        print("\n" + bold("### " + os.path.basename(t.rstrip("/\\"))))
+        apk = t
+        if os.path.isdir(t):
+            apks = sorted(glob.glob(os.path.join(t, "*.apk")))
+            apk = next((a for a in apks if "arm64" in a), apks[0])
+        try:
+            if args.action == "libs":
+                cmd_libs(A(apk=apk))
+            elif args.action == "scan":
+                cmd_scan(A(apk=apk, show=8, cap=200))
+        except SystemExit:
+            warn("skipped (unreadable).")
+
+
+def cmd_update(args):
+    """git pull the repo apkkit.py lives in (self-update)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isdir(os.path.join(here, ".git")):
+        erro("apkkit.py isn't inside a git checkout (" + here + ").")
+        print(dim("  Clone the repo, or just replace apkkit.py with the latest file."))
+        return
+    if not have("git"):
+        need("git") if "git" in INSTALL_HINTS else die("git not found.")
+    hdr("Updating apkkit (git pull) in " + here)
+    run_live(["git", "-C", here, "pull", "--ff-only"])
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="apkkit",
@@ -2383,6 +2775,7 @@ def build_parser():
     sp = add("cert", "install a Burp/Fiddler CA into the device SYSTEM trust store (rooted)")
     sp.add_argument("cert", nargs="?", help="exported CA file (.der / .cer / .pem / .crt)")
     sp.add_argument("--user", action="store_true", help="also push to /sdcard for manual user-store install")
+    sp.add_argument("--reboot", action="store_true", help="reboot the device after install (store re-read)")
     sp.set_defaults(func=cmd_cert)
 
     sp = add("flow", "pull -> merge -> (patch|gadget) -> install, one shot")
@@ -2407,13 +2800,16 @@ def build_parser():
     sp.add_argument("--version", help="frida-server version (default: your local frida version)")
     sp.add_argument("--no-start", action="store_true", help="install but don't launch it")
     sp.add_argument("--stop", action="store_true", help="stop a running frida-server")
+    sp.add_argument("--port", type=int, help="listen on a custom TCP port (anti-Frida evasion)")
+    sp.add_argument("--stealth", action="store_true", help="rename the binary + random port to dodge scans")
     sp.set_defaults(func=cmd_frida_server)
 
     sp = add("hook", "run a Frida script (spawn / attach / gadget)")
     sp.add_argument("target", help="package name, process name, or 'Gadget'")
     sp.add_argument("-l", "--script", help="path to a Frida JS script")
-    sp.add_argument("--builtin", choices=["ssl", "root", "trace", "flutter-ssl"],
-                    help="bundled script (flutter-ssl = Flutter BoringSSL bypass, needs the NVISO script)")
+    sp.add_argument("--builtin",
+                    choices=["ssl", "root", "trace", "flutter-ssl", "webview", "sqlite", "crypto"],
+                    help="bundled script (flutter-ssl needs the NVISO script)")
     sp.add_argument("--attach", action="store_true", help="attach by process name (-n)")
     sp.add_argument("--gadget", action="store_true", help="attach to a gadget-patched app")
     sp.set_defaults(func=cmd_hook)
@@ -2471,7 +2867,49 @@ def build_parser():
     sp.add_argument("--offset", help="ssl_verify_peer_cert offset (optional; auto-detected if omitted)")
     sp.set_defaults(func=cmd_flutter_patch)
 
+    sp = add("logcat", "stream filtered logcat (find why an app self-closes)")
+    sp.add_argument("package", nargs="?", help="package to follow (by pid); omit for full log")
+    sp.add_argument("-g", "--grep", help="custom filter regex (default: detection keywords)")
+    sp.add_argument("--all", action="store_true", help="don't filter - show everything")
+    sp.add_argument("--no-clear", action="store_true", help="don't clear the buffer first")
+    sp.set_defaults(func=cmd_logcat)
+
+    sp = add("checks", "find root/emulator/tamper/integrity checks in smali (apktool)")
+    sp.add_argument("apk")
+    sp.add_argument("--decoded", help="use an existing apktool-decoded dir")
+    sp.add_argument("--show", type=int, default=12, help="max hits shown per category")
+    sp.add_argument("--neutralize", action="store_true",
+                    help="strip self-kill calls (System.exit/killProcess/...) and rebuild+sign")
+    sp.set_defaults(func=cmd_checks)
+
+    sp = add("mitm", "one-shot: pull->merge->patch->install->cert->proxy->launch")
+    sp.add_argument("package")
+    sp.add_argument("--method", choices=["auto", "static", "reflutter", "gadget", "none"])
+    sp.add_argument("--cert", help="CA file to install into the system store")
+    sp.add_argument("--proxy", help="proxy ip:port to set on the device")
+    sp.add_argument("-t", "--transparent", action="store_true", help="iptables transparent redirect (rooted)")
+    sp.add_argument("--launch", action="store_true", help="launch the app when done")
+    sp.add_argument("--off", action="store_true", help="teardown: clear proxy + uninstall the app")
+    sp.set_defaults(func=lambda a: (cmd_mitm_off(resolve_serial(a), a.package) if a.off else cmd_mitm(a)))
+
+    sp = add("emulator", "list AVDs, or launch one with RE-friendly flags")
+    sp.add_argument("name", nargs="?", help="AVD name (omit to list)")
+    sp.add_argument("--writable-system", action="store_true", help="mountable /system (persist system certs)")
+    sp.add_argument("--proxy", help="launch with -http-proxy ip:port")
+    sp.add_argument("--cold", action="store_true", help="cold boot (no snapshot)")
+    sp.add_argument("--extra", help="extra raw flags passed to the emulator")
+    sp.set_defaults(func=cmd_emulator)
+
+    sp = add("batch", "run an inspection across every app under a folder")
+    sp.add_argument("action", choices=["classify", "libs", "scan"], help="what to run on each")
+    sp.add_argument("--dir", help="folder of apks / pulled_apks (default ./pulled_apks)")
+    sp.set_defaults(func=cmd_batch)
+
+    sp = add("update", "self-update: git pull the apkkit checkout")
+    sp.set_defaults(func=cmd_update)
+
     sp = add("doctor", "check external tools + show install steps")
+    sp.add_argument("--json", action="store_true", help="machine-readable tool status")
     sp.set_defaults(func=cmd_doctor)
 
     sp = add("config", "show / set saved tool paths")
@@ -2664,12 +3102,15 @@ def pick_script():
     builtins = [("ssl", "universal SSL pinning bypass (Java/OkHttp)"),
                 ("root", "root-detection bypass"),
                 ("trace", "method tracer (edit target)"),
-                ("flutter-ssl", "Flutter BoringSSL bypass (needs NVISO script)")]
+                ("flutter-ssl", "Flutter BoringSSL bypass (needs NVISO script)"),
+                ("webview", "WebView URL / JS-bridge inspector"),
+                ("sqlite", "SQLite query logger"),
+                ("crypto", "Cipher / hash monitor")]
     customs = sorted(f for f in os.listdir(SCRIPTS_DIR)
                      if f.endswith(".js") and f not in BUILTIN_SCRIPTS)
     print()
     for i, (k, d) in enumerate(builtins, 1):
-        print("  " + mag(str(i)) + ". " + k.ljust(8) + dim(d))
+        print("  " + mag(str(i)) + ". " + k.ljust(12) + dim(d))
     for j, f in enumerate(customs, len(builtins) + 1):
         print("  " + mag(str(j)) + ". " + f)
     print("  " + mag("p") + ". type a custom path")
@@ -2810,7 +3251,7 @@ def act_frida_server():
 @submenu
 def menu_scripts():
     items = [
-        ("Write the 3 built-in scripts to disk", "ssl-bypass / root-bypass / trace",
+        ("Write the built-in scripts to disk", "ssl / root / trace / webview / sqlite / crypto",
          lambda: cmd_scripts(A(out=None))),
         ("Add a custom script (paste code)", "saved to " + SCRIPTS_DIR,
          add_custom_script_interactive),
@@ -2971,6 +3412,77 @@ def menu_inspect():
     ])
 
 
+def act_logcat():
+    box("logcat (find why an app self-closes)")
+    pkg = ask("package to follow (blank = full log)")
+    cmd_logcat(A(package=pkg or None, grep=None, all=False, no_clear=False))
+
+
+def act_checks():
+    box("Anti-analysis checks (smali)")
+    apk = ask_target("apk to inspect")
+    if not apk:
+        return warn("no apk.")
+    neut = ask_yn("also strip self-kill calls (System.exit/killProcess) and rebuild?", False)
+    cmd_checks(A(apk=apk, decoded=None, show=12, neutralize=neut))
+
+
+def act_mitm():
+    box("MITM setup (pull -> patch -> install -> cert -> proxy -> launch)")
+    serial = resolve_serial(A())
+    pkg = ask("package name (blank = browse)")
+    if not pkg:
+        pkg = choose_package(serial)
+        if not pkg:
+            return warn("no package chosen.")
+    method = ask("patch method [auto/static/reflutter/gadget/none]", "auto")
+    cert = ask("CA file to trust (blank = skip)")
+    prox = ask("proxy ip:port (blank = skip)")
+    tr = ask_yn("iptables transparent redirect (rooted)?", False) if prox else False
+    launch = ask_yn("launch the app when done?", True)
+    cmd_mitm(A(package=pkg, serial=serial, method=method, cert=cert or None,
+               proxy=prox or None, transparent=tr, launch=launch, off=False))
+
+
+def act_emulator():
+    box("Emulator (AVDs)")
+    name = ask("AVD name (blank = list)")
+    if not name:
+        return cmd_emulator(A(name=None))
+    ws = ask_yn("writable system? (persist system certs)", True)
+    prox = ask("launch with proxy ip:port (blank = none)")
+    cold = ask_yn("cold boot?", False)
+    cmd_emulator(A(name=name, writable_system=ws, proxy=prox or None, cold=cold, extra=None))
+
+
+def act_batch():
+    box("Batch inspect (all apps under a folder)")
+    print("  " + mag("1") + ". classify (Flutter/native)   " + mag("2") + ". libs   " + mag("3") + ". scan")
+    c = ask("choose", "1")
+    action = {"1": "classify", "2": "libs", "3": "scan"}.get(c, "classify")
+    d = ask("folder (blank = ./pulled_apks)")
+    cmd_batch(A(action=action, dir=d or None))
+
+
+@submenu
+def menu_diag():
+    run_menu("Diagnostics & analysis", [
+        ("logcat", "stream filtered logs (why does it close?)", act_logcat),
+        ("checks", "find root/emulator/tamper checks in smali", act_checks),
+        ("batch", "classify / libs / scan across all pulled apps", act_batch),
+    ])
+
+
+@submenu
+def menu_net():
+    run_menu("MITM & network", [
+        ("MITM setup (one shot)", "patch + install + cert + proxy + launch", act_mitm),
+        ("Proxy (Burp/Fiddler)", "set/clear device proxy + iptables", act_proxy),
+        ("Install CA cert", "push a CA into the system store (rooted)", act_cert),
+        ("Emulator (AVDs)", "list / launch a rooted AVD", act_emulator),
+    ])
+
+
 def interactive_menu():
     startup_animation()
     while True:
@@ -2985,6 +3497,8 @@ def interactive_menu():
             ("Frida & objection", "hooks, gadget attach, scripts", menu_frida),
             ("Inspect an apk", "info, libs, strings, scan, decode", menu_inspect),
             ("Flutter (Dart) tools", "Blutter static / reFlutter MITM", menu_flutter),
+            ("MITM & network", "proxy, CA cert, emulator, one-shot MITM", menu_net),
+            ("Diagnostics & analysis", "logcat, checks, batch", menu_diag),
             ("Doctor", "check tools + install instructions", lambda: cmd_doctor(A())),
             ("Config", "save tool paths", act_config),
         ]

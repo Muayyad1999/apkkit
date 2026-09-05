@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4
+- New: `logcat` (filtered, finds self-close reasons), `checks` (locate root/emulator/
+  tamper/integrity checks in smali, `--neutralize` strips self-kill calls & rebuilds),
+  `mitm` (one-shot pull→patch→install→cert→proxy→launch, `--off` teardown),
+  `emulator` (list/launch AVDs with -writable-system/-http-proxy/cold boot),
+  `batch` (classify/libs/scan every pulled app), `update` (git self-update).
+- `frida-server --port/--stealth` (custom port + renamed binary to dodge Frida scans).
+- `cert --reboot`; `doctor --json`; three more bundled hooks (webview, sqlite, crypto).
+- Fixes: `sign` returns the real output path (apksigner users no longer get unsigned
+  apks); frida/objection honour the chosen serial; `-s` works after the subcommand;
+  zip-slip guard; UTF-8 decode of tool output; EOF-safe device picker.
+
 ## Unreleased
 - `frida-server` now auto-downloads the matching version, pushes it, and starts it
   on a rooted device (`--no-start`, `--stop`, `--version`).
