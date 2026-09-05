@@ -14,6 +14,7 @@ Device / build:
     install   (re)install an apk or a split folder
     uninstall remove a package
     proxy     point the device at Burp/Fiddler (global proxy + iptables)
+    cert      install a Burp/Fiddler CA into the system store (rooted)
     flow      pull -> merge -> (patch | gadget) -> install, one shot
 
 Dynamic instrumentation (the unrooted-friendly part):
@@ -284,6 +285,12 @@ def have(tool):
 
 def _quote(a):
     return ('"' + a + '"') if (" " in a or "\\" in a) else a
+
+
+def _su(serial, command):
+    """adb argv to run `command` as root via su -c, correctly quoted as ONE token.
+    (command must not contain a single quote.)"""
+    return ["adb", "-s", serial, "shell", "su -c '" + command + "'"]
 
 
 def run_live(cmd, env=None):
@@ -621,6 +628,113 @@ def cmd_install(args):
 # --------------------------------------------------------------------------- #
 # commands: build / transform
 # --------------------------------------------------------------------------- #
+def _der_from_cert(path):
+    """Return the DER bytes of a certificate given a PEM or DER file."""
+    import base64
+    data = open(path, "rb").read()
+    if b"-----BEGIN" in data:
+        m = re.search(rb"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", data, re.S)
+        if not m:
+            raise ValueError("no PEM certificate found")
+        return base64.b64decode(b"".join(m.group(1).split()))
+    return data
+
+
+def _subject_hash_old(der):
+    """OpenSSL X509_NAME_hash_old of the subject: md5(subject DER), 4 bytes LE, hex."""
+    def rd(b, i):
+        j = i + 1
+        l = b[j]; j += 1
+        if l & 0x80:
+            n = l & 0x7F; l = int.from_bytes(b[j:j + n], "big"); j += n
+        return j, l
+    vs, _ = rd(der, 0)              # outer cert SEQUENCE -> value start
+    ts, _ = rd(der, vs)            # tbsCertificate SEQUENCE -> value start
+    i = ts
+    if der[i] == 0xA0:             # optional [0] version
+        vv, vl = rd(der, i); i = vv + vl
+    for _ in range(4):            # serialNumber, signature, issuer, validity
+        vv, vl = rd(der, i); i = vv + vl
+    start = i                      # subject Name SEQUENCE (full TLV)
+    vv, vl = rd(der, i); end = vv + vl
+    import hashlib
+    h = hashlib.md5(der[start:end]).digest()
+    return "%08x" % int.from_bytes(h[:4], "little")
+
+
+def cmd_cert(args):
+    """Install a Burp/Fiddler CA into the device's SYSTEM trust store (rooted)."""
+    import base64
+    if not have("adb"):
+        need("adb")
+    serial = resolve_serial(args)
+    cert = args.cert
+    if not cert or not os.path.isfile(cert):
+        die("Give the exported CA file: apkkit cert <burp-cacert.der | fiddler.cer | ca.pem>")
+    try:
+        der = _der_from_cert(cert)
+        h = _subject_hash_old(der)
+    except Exception as e:
+        die("Couldn't parse the certificate: " + str(e))
+
+    name = h + ".0"
+    pem = ("-----BEGIN CERTIFICATE-----\n" +
+           base64.encodebytes(der).decode().strip() +
+           "\n-----END CERTIFICATE-----\n")
+    local = os.path.join(CACHE_DIR, name)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(local, "w") as f:
+        f.write(pem)
+
+    api = 0
+    try:
+        api = int(prop(serial, "ro.build.version.sdk") or "0")
+    except ValueError:
+        pass
+    hdr("Install CA -> system store  (" + name + ", sdk " + str(api) + ")")
+    dev_tmp = "/data/local/tmp/" + name
+    if run_live(["adb", "-s", serial, "push", local, dev_tmp]) != 0:
+        return erro("push failed.")
+
+    store = "/system/etc/security/cacerts"
+    if api >= 34:
+        warn("Android 14+ keeps CA certs in an APEX - a plain copy may not stick.")
+        info("trying the tmpfs overlay method ...")
+        script = (
+            "set -e; d=" + store + "; "
+            "mkdir -p -m 700 /data/local/tmp/cacopy; "
+            "cp /apex/com.android.conscrypt/cacerts/* /data/local/tmp/cacopy/ 2>/dev/null || true; "
+            "mount -t tmpfs tmpfs $d; "
+            "cp /data/local/tmp/cacopy/* $d/ 2>/dev/null || true; "
+            "cp " + dev_tmp + " $d/" + name + "; "
+            "chown 0:0 $d/*; chmod 644 $d/*; "
+            "chcon u:object_r:system_security_cacerts_file:s0 $d/* 2>/dev/null || true; "
+            "echo OK")
+    else:
+        script = (
+            "set -e; "
+            "mount -o rw,remount / 2>/dev/null || mount -o rw,remount /system; "
+            "cp " + dev_tmp + " " + store + "/" + name + "; "
+            "chown 0:0 " + store + "/" + name + "; chmod 644 " + store + "/" + name + "; "
+            "chcon u:object_r:system_security_cacerts_file:s0 " + store + "/" + name + " 2>/dev/null || true; "
+            "echo OK")
+
+    rc = run_live(_su(serial, script))
+    if rc == 0:
+        ok("installed as " + store + "/" + name)
+        print(dim("  Reboot the emulator (or the app) so the store is re-read: apkkit ... adb reboot"))
+        if api >= 34:
+            print(dim("  If apps still reject it, use the Magisk module route (AlwaysTrustUserCerts)."))
+    else:
+        erro("system install failed (device not rooted? su denied?).")
+        print(dim("  Fallback (no root, user store): apkkit cert " + _quote(cert) + " --user"))
+
+    if args.user:
+        info("also pushing to /sdcard for manual user-store install ...")
+        run_live(["adb", "-s", serial, "push", local, "/sdcard/" + name + ".crt"])
+        print(dim("  On device: Settings > Security > Install a certificate > CA cert > pick /sdcard/" + name + ".crt"))
+
+
 def cmd_proxy(args):
     """Point the device's traffic at your Burp/Fiddler proxy (and optionally
     force it with iptables for apps that ignore the proxy, e.g. Flutter)."""
@@ -633,7 +747,7 @@ def cmd_proxy(args):
         hdr("Clearing proxy on " + serial)
         run_live(["adb", "-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"])
         info("flushing iptables nat OUTPUT (rooted) ...")
-        run_live(["adb", "-s", serial, "shell", "su", "-c", "iptables -t nat -F OUTPUT"])
+        run_live(_su(serial, "iptables -t nat -F OUTPUT"))
         ok("global proxy cleared; transparent redirect removed (if it was set).")
         print(dim("  (restart the target app so it drops the old proxy.)"))
         return
@@ -644,7 +758,7 @@ def cmd_proxy(args):
         hdr("Proxy status on " + serial)
         _, out, _ = adb(["shell", "settings", "get", "global", "http_proxy"], serial=serial)
         print("  global http_proxy: " + bold(out.strip() or "(unset)"))
-        rc, out, _ = adb(["shell", "su", "-c", "iptables -t nat -S OUTPUT"], serial=serial)
+        rc, out, _ = adb(["shell", "su -c 'iptables -t nat -S OUTPUT'"], serial=serial)
         if rc == 0 and out.strip():
             print(dim("  nat OUTPUT rules:"))
             for line in out.splitlines():
@@ -668,9 +782,9 @@ def cmd_proxy(args):
         info("adding iptables DNAT for 80/443 -> " + target + " (needs root) ...")
         ok_all = True
         for dport in ("80", "443"):
-            rc = run_live(["adb", "-s", serial, "shell", "su", "-c",
+            rc = run_live(_su(serial,
                            "iptables -t nat -A OUTPUT -p tcp --dport " + dport +
-                           " -j DNAT --to-destination " + target])
+                           " -j DNAT --to-destination " + target))
             ok_all = ok_all and rc == 0
         if ok_all:
             ok("transparent redirect added for ports 80 and 443.")
@@ -898,7 +1012,7 @@ def cmd_frida_server(args):
 
     if args.stop:
         hdr("Stopping frida-server on " + serial)
-        run_live(["adb", "-s", serial, "shell", "su", "-c", "pkill -f frida-server"])
+        run_live(_su(serial, "pkill -f frida-server"))
         ok("stop signal sent.")
         return
 
@@ -939,7 +1053,7 @@ def cmd_frida_server(args):
     info("pushing to " + dev_path + " ...")
     if run_live(["adb", "-s", serial, "push", cached, dev_path]) != 0:
         return erro("push failed.")
-    run_live(["adb", "-s", serial, "shell", "su", "-c", "chmod 755 " + dev_path])
+    run_live(_su(serial, "chmod 755 " + dev_path))
 
     if args.no_start:
         ok("installed (not started). Start later with: apkkit frida-server")
@@ -947,8 +1061,7 @@ def cmd_frida_server(args):
 
     info("starting frida-server as root (background) ...")
     try:
-        subprocess.Popen(["adb", "-s", serial, "shell",
-                          "su -c 'nohup " + dev_path + " >/dev/null 2>&1 &'"])
+        subprocess.Popen(_su(serial, "nohup " + dev_path + " >/dev/null 2>&1 &"))
     except Exception as e:
         return erro("failed to launch: " + str(e))
     time.sleep(2)
@@ -2248,6 +2361,11 @@ def build_parser():
                     help="also add iptables DNAT for 80/443 (ROOTED; catches proxy-ignoring apps like Flutter)")
     sp.set_defaults(func=cmd_proxy)
 
+    sp = add("cert", "install a Burp/Fiddler CA into the device SYSTEM trust store (rooted)")
+    sp.add_argument("cert", nargs="?", help="exported CA file (.der / .cer / .pem / .crt)")
+    sp.add_argument("--user", action="store_true", help="also push to /sdcard for manual user-store install")
+    sp.set_defaults(func=cmd_cert)
+
     sp = add("flow", "pull -> merge -> (patch|gadget) -> install, one shot")
     sp.add_argument("package"); sp.add_argument("-o", "--out"); sp.add_argument("--apkeditor")
     sp.add_argument("--auto", action="store_true",
@@ -2730,6 +2848,15 @@ def act_config():
 
 
 # ---- submenus ------------------------------------------------------------ #
+def act_cert():
+    box("Install CA into system store (rooted)")
+    c = ask_target("exported CA file (.der/.cer/.pem/.crt)")
+    if not c:
+        return warn("no file given.")
+    also = ask_yn("also push to /sdcard for manual user-store install?", False)
+    cmd_cert(A(cert=c, user=also))
+
+
 def act_proxy():
     box("Device proxy for Burp / Fiddler")
     print("  " + mag("1") + ". set proxy    " + mag("2") + ". clear (off)    " + mag("3") + ". status")
@@ -2753,6 +2880,7 @@ def menu_device():
          lambda: cmd_list(A(vendor=False, system=False, grep=ask("filter (blank=all)") or None))),
         ("Pull app(s)", "grab base + split APKs off the device", act_pull),
         ("Proxy (Burp/Fiddler)", "set/clear device proxy + iptables redirect", act_proxy),
+        ("Install CA cert", "push a Burp/Fiddler CA into the system store (rooted)", act_cert),
     ])
 
 
