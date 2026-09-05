@@ -51,6 +51,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1881,6 +1882,95 @@ def cmd_reflutter(args):
     print(dim("  On the device: set proxy to <your-ip>:8083 (or manual proxy) and trust your CA."))
 
 
+def _elf_vaddr_to_off(data, vaddr):
+    """Map a virtual offset (what Frida reports) to a file offset in an ELF64 .so."""
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return None
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for i in range(e_phnum):
+        b = e_phoff + i * e_phentsize
+        if struct.unpack_from("<I", data, b)[0] != 1:   # PT_LOAD
+            continue
+        p_offset = struct.unpack_from("<Q", data, b + 8)[0]
+        p_vaddr = struct.unpack_from("<Q", data, b + 0x10)[0]
+        p_filesz = struct.unpack_from("<Q", data, b + 0x20)[0]
+        if p_vaddr <= vaddr < p_vaddr + p_filesz:
+            return vaddr - p_vaddr + p_offset
+    return None
+
+
+def _zip_replace(src_apk, out_apk, entry_name, new_bytes):
+    """Copy src_apk to out_apk, replacing one entry's bytes."""
+    zin = zipfile.ZipFile(src_apk, "r")
+    zout = zipfile.ZipFile(out_apk, "w", zipfile.ZIP_DEFLATED)
+    try:
+        for item in zin.infolist():
+            data = new_bytes if item.filename == entry_name else zin.read(item.filename)
+            # keep .so stored (uncompressed) like modern apks do; others deflate
+            ct = zipfile.ZIP_STORED if item.filename.endswith(".so") else zipfile.ZIP_DEFLATED
+            zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+            zi.external_attr = item.external_attr
+            zi.compress_type = ct
+            zout.writestr(zi, data)
+    finally:
+        zin.close()
+        zout.close()
+
+
+def cmd_flutter_patch(args):
+    """Static Flutter TLS bypass: NOP ssl_verify_peer_cert in libflutter.so. No Frida, no root."""
+    apk = args.apk
+    if os.path.isdir(apk):
+        die("Point at a single merged .apk (run `apkkit merge <folder>` first).")
+    if not os.path.isfile(apk):
+        die("Not found: " + apk)
+
+    z = _open_apk(apk)
+    target = "lib/arm64-v8a/libflutter.so"
+    if target not in z.namelist():
+        z.close()
+        die("No " + target + " in this apk (arm64 Flutter only).")
+    so = z.read(target)
+    z.close()
+
+    if not args.offset:
+        die("Need --offset. Get it by running the Frida bypass once - it prints\n"
+            "      '[+] ssl_verify_peer_cert found at offset: 0x...':\n"
+            "        apkkit hook <pkg> --gadget --builtin flutter-ssl\n"
+            "      then: apkkit flutter-patch " + _quote(apk) + " --offset 0xXXXXXX")
+    try:
+        vaddr = int(args.offset, 16) if isinstance(args.offset, str) else int(args.offset)
+    except ValueError:
+        die("--offset must be hex like 0x753dc8")
+
+    foff = _elf_vaddr_to_off(so, vaddr)
+    if foff is None or foff + 8 > len(so):
+        die("Offset " + hex(vaddr) + " doesn't map into libflutter.so - is it the right value/app?")
+
+    hdr("Static Flutter TLS patch @ " + hex(vaddr) + "  (file off " + hex(foff) + ")")
+    # arm64: mov w0, #0 (ssl_verify_ok) ; ret
+    patch = bytes([0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6])
+    info("original bytes: " + so[foff:foff + 8].hex() + "  ->  " + patch.hex())
+    patched = so[:foff] + patch + so[foff + 8:]
+
+    out = _base(apk) + "-flutterpatched.apk"
+    info("rebuilding apk with patched libflutter.so ...")
+    _zip_replace(apk, out, target, patched)
+    ok("patched apk: " + out)
+    if resolve_uber() or (have("apksigner") and have("zipalign")):
+        cmd_sign(A(apk=out, keystore=None))
+        signed = _base(out) + "-aligned-debugSigned.apk"
+        if os.path.isfile(signed):
+            ok("signed: " + signed)
+            print(dim("  Install it, set a proxy, and the app trusts any cert - no Frida, no root."))
+    else:
+        warn("apk is unsigned - run: apkkit sign " + _quote(out))
+    print(dim("  NOTE: this repackages the apk. If the app self-closes on launch, it has"))
+    print(dim("  tamper detection - a TLS patch won't help; that check must be removed too."))
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="apkkit",
@@ -2017,6 +2107,11 @@ def build_parser():
     sp.add_argument("apk"); sp.add_argument("--sign", action="store_true",
                     help="sign the patched apk afterwards")
     sp.set_defaults(func=cmd_reflutter)
+
+    sp = add("flutter-patch", "Flutter: static libflutter.so TLS bypass (no Frida, no root)")
+    sp.add_argument("apk", help="a merged .apk")
+    sp.add_argument("--offset", help="ssl_verify_peer_cert offset, e.g. 0x753dc8 (from flutter-ssl run)")
+    sp.set_defaults(func=cmd_flutter_patch)
 
     sp = add("doctor", "check external tools + show install steps")
     sp.set_defaults(func=cmd_doctor)
@@ -2451,13 +2546,21 @@ def act_reflutter():
     cmd_reflutter(A(apk=apk, sign=sign))
 
 
+def act_flutter_patch():
+    box("Static Flutter TLS patch (no Frida / no root)")
+    apk = ask_target("merged apk")
+    off = ask("ssl_verify_peer_cert offset (0x… from a flutter-ssl run)")
+    cmd_flutter_patch(A(apk=apk, offset=off or None))
+
+
 @submenu
 def menu_flutter():
     run_menu("Flutter (Dart) tools", [
         ("Detect / native libs", "is it Flutter? which ABIs?",
-         lambda: cmd_libs(A(apk=ask("apk")))),
+         lambda: cmd_libs(A(apk=ask_target("apk or folder")))),
         ("Blutter — static analysis", "Dart class/method names + blutter_frida.js", act_blutter),
-        ("reFlutter — MITM patch", "the only way to intercept Flutter HTTPS", act_reflutter),
+        ("reFlutter — MITM patch", "patch engine for HTTPS interception", act_reflutter),
+        ("Static TLS patch", "NOP libflutter ssl_verify (no Frida/root)", act_flutter_patch),
     ])
 
 
