@@ -308,7 +308,7 @@ def run_live(cmd, env=None):
 def adb(args, serial=None, check=False):
     cmd = ["adb"] + (["-s", serial] if serial else []) + args
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     except FileNotFoundError:
         need("adb")
     if check and p.returncode != 0:
@@ -352,7 +352,10 @@ def resolve_serial(args, interactive=True):
     if not interactive:
         die("Several devices attached - pass -s <serial>.")
     while True:
-        c = input("Use which device?  # ").strip()
+        try:
+            c = input("Use which device?  # ").strip()
+        except EOFError:
+            die("Several devices attached - pass -s <serial>.")
         if c.isdigit() and 1 <= int(c) <= len(devs):
             return devs[int(c) - 1]
         print("  Enter a number from the list.")
@@ -631,7 +634,8 @@ def cmd_install(args):
 def _der_from_cert(path):
     """Return the DER bytes of a certificate given a PEM or DER file."""
     import base64
-    data = open(path, "rb").read()
+    with open(path, "rb") as f:
+        data = f.read()
     if b"-----BEGIN" in data:
         m = re.search(rb"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", data, re.S)
         if not m:
@@ -912,9 +916,8 @@ def cmd_gadget(args):
         if args.sign:
             print()
             info("re-signing with uber-apk-signer (objection's own signing is flaky on Windows) ...")
-            cmd_sign(A(apk=out, keystore=None))
-            signed = _base(out) + "-aligned-debugSigned.apk"
-            if os.path.isfile(signed):
+            signed = _sign(out)
+            if signed:
                 install_target = signed
         else:
             print(dim("  If install fails with a certificate error, run: ") + "apkkit sign " + _quote(out))
@@ -930,11 +933,12 @@ def cmd_gadget(args):
 def cmd_frida_ps(args):
     if not have("frida-ps"):
         need("python-frida", "frida-ps")
-    hdr("Apps / processes on USB device")
-    mode = "-Uai" if args.apps else "-Ua"
+    serial = resolve_serial(args)
+    hdr("Apps / processes on " + serial)
+    mode = "-ai" if args.apps else "-a"
     if args.all:
-        mode = "-U"
-    run_live(["frida-ps", mode])
+        mode = ""
+    run_live(["frida-ps", "-D", serial] + ([mode] if mode else []))
 
 
 def cmd_hook(args):
@@ -948,8 +952,9 @@ def cmd_hook(args):
         die("No script to run. Pass -l <script.js> or --builtin ssl|root|trace.")
 
     target = args.target
+    serial = resolve_serial(args)
     hdr("Frida hook: " + target)
-    base = ["frida", "-U"]
+    base = ["frida", "-D", serial]
     if args.gadget:
         # gadget is already running inside the app; attach by its name (Gadget)
         cmd = base + [target, "-l", script]
@@ -971,8 +976,9 @@ def cmd_objection(args):
     target = args.gadget or args.package
     if not target:
         die("Pass -g <gadget-name> (unrooted) or -p <package> (rooted frida-server).")
+    serial = resolve_serial(args)
     hdr("objection explore: " + target)
-    cmd = ["objection", "-g", target, "explore"]
+    cmd = ["objection", "-S", serial, "-g", target, "explore"]
     startups = []
     if args.sslpinning:
         startups.append("android sslpinning disable")
@@ -991,7 +997,7 @@ def cmd_objection(args):
 def _frida_version():
     if not have("frida"):
         return None
-    p = subprocess.run(["frida", "--version"], capture_output=True, text=True)
+    p = subprocess.run(["frida", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return (p.stdout or "").strip() or None
 
 
@@ -1073,26 +1079,29 @@ def cmd_frida_server(args):
         warn("couldn't confirm - check: adb shell su -c \"ps -A | grep frida\"")
 
 
-def cmd_sign(args):
-    apk = args.apk
+def _sign(apk, keystore=None):
+    """Sign an apk and return the PATH of the produced signed apk, or None.
+    Works with uber-apk-signer (preferred) or apksigner+zipalign - callers must
+    use the returned path, not guess the filename."""
     if not os.path.isfile(apk):
-        die("Not found: " + apk)
-    hdr("Sign " + apk)
+        erro("Not found: " + apk)
+        return None
     uber = resolve_uber()
     if uber and have("java"):
-        info("using uber-apk-signer (zipalign + sign in one step)")
+        info("signing with uber-apk-signer ...")
         rc = run_live(["java", "-jar", uber, "-a", apk, "--allowResign"])
-        if rc == 0:
-            ok("signed. Look for *-aligned-*Signed.apk beside the input.")
-        else:
-            erro("uber-apk-signer exited " + str(rc))
-        return
+        cands = glob.glob(_base(apk) + "-aligned*Signed.apk")
+        if rc == 0 and cands:
+            return sorted(cands)[0]
+        erro("uber-apk-signer exited " + str(rc))
+        return None
     if have("apksigner") and have("zipalign"):
         aligned = _base(apk) + "-aligned.apk"
         info("zipalign -> " + aligned)
         if run_live(["zipalign", "-f", "-p", "4", apk, aligned]) != 0:
-            return erro("zipalign failed")
-        ks = args.keystore or os.path.join(HOME, ".apkkit", "debug.keystore")
+            erro("zipalign failed")
+            return None
+        ks = keystore or os.path.join(HOME, ".apkkit", "debug.keystore")
         if not os.path.isfile(ks):
             os.makedirs(os.path.dirname(ks), exist_ok=True)
             info("creating a debug keystore at " + ks)
@@ -1102,11 +1111,25 @@ def cmd_sign(args):
                       "-dname", "CN=apkkit"])
         rc = run_live(["apksigner", "sign", "--ks", ks, "--ks-pass", "pass:apkkit",
                        "--key-pass", "pass:apkkit", aligned])
-        (ok if rc == 0 else erro)("apksigner exited " + str(rc) + " -> " + aligned)
-        return
+        if rc == 0 and os.path.isfile(aligned):
+            return aligned
+        erro("apksigner exited " + str(rc))
+        return None
     erro("No signer found.")
     hint("uber-apk-signer")
     hint("apksigner")
+    return None
+
+
+def cmd_sign(args):
+    apk = args.apk
+    if not os.path.isfile(apk):
+        die("Not found: " + apk)
+    hdr("Sign " + apk)
+    out = _sign(apk, args.keystore)
+    if out:
+        ok("signed: " + out)
+    return out
 
 
 def cmd_scripts(args):
@@ -1626,7 +1649,7 @@ def cmd_info(args):
         z.close()
         hint("aapt")
         return
-    p = subprocess.run([aapt, "dump", "badging", apk], capture_output=True, text=True)
+    p = subprocess.run([aapt, "dump", "badging", apk], capture_output=True, text=True, encoding="utf-8", errors="replace")
     out = p.stdout or ""
     pkg = re.search(r"package: name='([^']+)'.*versionCode='([^']*)'.*versionName='([^']*)'", out)
     sdk = re.search(r"sdkVersion:'([^']*)'", out)
@@ -1727,12 +1750,8 @@ def _flow_gadget(merged, serial, no_nsc):
         warn("no *.objection.apk produced; using merged apk.")
         return merged
     ok("gadget injected: " + cand)
-    if resolve_uber():
-        cmd_sign(A(apk=cand, keystore=None))
-        signed = _base(cand) + "-aligned-debugSigned.apk"
-        if os.path.isfile(signed):
-            return signed
-    return cand
+    signed = _sign(cand)
+    return signed or cand
 
 
 def _static_flutter_patch(apk):
@@ -1750,9 +1769,7 @@ def _static_flutter_patch(apk):
     patch = bytes([0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6])   # mov w0,#0 ; ret
     out = _base(apk) + "-flutterpatched.apk"
     _zip_replace(apk, out, "lib/arm64-v8a/libflutter.so", so[:foff] + patch + so[foff + 8:])
-    cmd_sign(A(apk=out, keystore=None))
-    signed = _base(out) + "-aligned-debugSigned.apk"
-    return signed if os.path.isfile(signed) else out
+    return _sign(out) or out
 
 
 def _flow_reflutter(merged):
@@ -1768,9 +1785,7 @@ def _flow_reflutter(merged):
     if not cands:
         return None
     out = sorted(cands)[0]
-    cmd_sign(A(apk=out, keystore=None))
-    signed = _base(out) + "-aligned-debugSigned.apk"
-    return signed if os.path.isfile(signed) else out
+    return _sign(out) or out
 
 
 def _apply_patch(choice, merged, flut, serial, args):
@@ -1847,7 +1862,7 @@ def cmd_flow(args):
     serial = resolve_serial(args)
     pkg = args.package
     out_dir = args.out or DEFAULT_PULL_DIR
-    mode = "gadget" if args.gadget else ("none" if args.no_patch else "apk-mitm")
+    mode = "none" if args.no_patch else ("gadget" if args.gadget else (args.method or "auto"))
     total = 3 + (1 if args.install else 0)
 
     hdr("FLOW: " + pkg + dim("   (patch mode: " + mode + ")"))
@@ -1880,16 +1895,13 @@ def cmd_flow(args):
     final, method = _apply_patch(choice, merged, flut, serial, args)
 
     # never try to install an unsigned apk (raw APKEditor output won't verify)
-    if args.install and not (final.endswith("Signed.apk") or final.endswith("-patched.apk")):
-        if resolve_uber():
-            info("signing the apk before install ...")
-            cmd_sign(A(apk=final, keystore=None))
-            s = _base(final) + "-aligned-debugSigned.apk"
-            if os.path.isfile(s):
-                final = s
+    if args.install and not (final.endswith("Signed.apk") or final.endswith("-aligned.apk") or final.endswith("-patched.apk")):
+        info("signing the apk before install ...")
+        signed = _sign(final)
+        if signed:
+            final = signed
         else:
-            warn("apk is unsigned and uber-apk-signer isn't set - install may fail. "
-                 "Run: apkkit config --uber <path>")
+            warn("couldn't sign - install may fail. Set a signer: apkkit config --uber <path>")
 
     if args.install:
         step(total, total, "Install")
@@ -1967,13 +1979,16 @@ def is_flutter(apk):
 def _extract_dir(apk, subdir, out):
     z = _open_apk(apk)
     got = []
+    out_root = os.path.realpath(out)
     for n in z.namelist():
         if n.startswith(subdir) and not n.endswith("/"):
-            data = z.read(n)
             dest = os.path.join(out, n.replace("/", os.sep))
+            if not os.path.realpath(dest).startswith(out_root + os.sep):
+                warn("skipping suspicious zip entry: " + n)
+                continue
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as f:
-                f.write(data)
+                f.write(z.read(n))
             got.append(os.path.basename(n))
     z.close()
     return got
@@ -2105,7 +2120,9 @@ def cmd_reflutter(args):
         return
     ok("patched: " + out)
     if args.sign:
-        cmd_sign(A(apk=out, keystore=None))
+        signed = _sign(out)
+        if signed:
+            ok("signed: " + signed)
     else:
         print(dim("  Next: ") + "apkkit sign " + _quote(out) + dim("  then  ") + "apkkit install <signed>")
     print(dim("  On the device: set proxy to <your-ip>:8083 (or manual proxy) and trust your CA."))
@@ -2284,12 +2301,10 @@ def cmd_flutter_patch(args):
     info("rebuilding apk with patched libflutter.so ...")
     _zip_replace(apk, out, target, patched)
     ok("patched apk: " + out)
-    if resolve_uber() or (have("apksigner") and have("zipalign")):
-        cmd_sign(A(apk=out, keystore=None))
-        signed = _base(out) + "-aligned-debugSigned.apk"
-        if os.path.isfile(signed):
-            ok("signed: " + signed)
-            print(dim("  Install it, set a proxy, and the app trusts any cert - no Frida, no root."))
+    signed = _sign(out)
+    if signed:
+        ok("signed: " + signed)
+        print(dim("  Install it, set a proxy, and the app trusts any cert - no Frida, no root."))
     else:
         warn("apk is unsigned - run: apkkit sign " + _quote(out))
     print(dim("  NOTE: this repackages the apk. If the app self-closes on launch, it has"))
@@ -2307,8 +2322,12 @@ def build_parser():
     p.add_argument("-V", "--version", action="version", version="apkkit " + __version__)
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
+    # shared options every subcommand accepts (so `apkkit install app.apk -s <serial>` works)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-s", "--serial", help="target device serial")
+
     def add(name, help):
-        return sub.add_parser(name, help=help)
+        return sub.add_parser(name, help=help, parents=[common])
 
     sp = add("menu", "launch the interactive menu (default when no command)"); sp.set_defaults(func=lambda a: interactive_menu())
     sp = add("devices", "list attached devices");                sp.set_defaults(func=cmd_devices)
