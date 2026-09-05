@@ -13,6 +13,7 @@ Device / build:
     sign      zipalign + sign an apk                               (uber/apksigner)
     install   (re)install an apk or a split folder
     uninstall remove a package
+    proxy     point the device at Burp/Fiddler (global proxy + iptables)
     flow      pull -> merge -> (patch | gadget) -> install, one shot
 
 Dynamic instrumentation (the unrooted-friendly part):
@@ -620,6 +621,69 @@ def cmd_install(args):
 # --------------------------------------------------------------------------- #
 # commands: build / transform
 # --------------------------------------------------------------------------- #
+def cmd_proxy(args):
+    """Point the device's traffic at your Burp/Fiddler proxy (and optionally
+    force it with iptables for apps that ignore the proxy, e.g. Flutter)."""
+    if not have("adb"):
+        need("adb")
+    serial = resolve_serial(args)
+    target = (args.target or "").strip()
+
+    if target in ("off", "clear", "reset"):
+        hdr("Clearing proxy on " + serial)
+        run_live(["adb", "-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"])
+        info("flushing iptables nat OUTPUT (rooted) ...")
+        run_live(["adb", "-s", serial, "shell", "su", "-c", "iptables -t nat -F OUTPUT"])
+        ok("global proxy cleared; transparent redirect removed (if it was set).")
+        print(dim("  (restart the target app so it drops the old proxy.)"))
+        return
+
+    if target in ("status", ""):
+        if target == "":
+            info("no argument - showing status. Use: apkkit proxy <ip:port> | off | status")
+        hdr("Proxy status on " + serial)
+        _, out, _ = adb(["shell", "settings", "get", "global", "http_proxy"], serial=serial)
+        print("  global http_proxy: " + bold(out.strip() or "(unset)"))
+        rc, out, _ = adb(["shell", "su", "-c", "iptables -t nat -S OUTPUT"], serial=serial)
+        if rc == 0 and out.strip():
+            print(dim("  nat OUTPUT rules:"))
+            for line in out.splitlines():
+                if "DNAT" in line:
+                    print("    " + line.strip())
+        else:
+            print(dim("  iptables: not readable (device not rooted, or none set)"))
+        return
+
+    if ":" not in target:
+        target = "10.0.2.2:" + target
+        info("no host given - assuming the emulator host 10.0.2.2")
+    port = target.rpartition(":")[2]
+
+    hdr("Set proxy -> " + target + "  on " + serial)
+    run_live(["adb", "-s", serial, "shell", "settings", "put", "global", "http_proxy", target])
+    ok("global http_proxy = " + target)
+    print(dim("  restart the app so it picks up the new proxy."))
+
+    if args.transparent:
+        info("adding iptables DNAT for 80/443 -> " + target + " (needs root) ...")
+        ok_all = True
+        for dport in ("80", "443"):
+            rc = run_live(["adb", "-s", serial, "shell", "su", "-c",
+                           "iptables -t nat -A OUTPUT -p tcp --dport " + dport +
+                           " -j DNAT --to-destination " + target])
+            ok_all = ok_all and rc == 0
+        if ok_all:
+            ok("transparent redirect added for ports 80 and 443.")
+            print(dim("  Enable your proxy's INVISIBLE/transparent listener on port " + port + ":"))
+            print(dim("    Burp: Proxy settings > listener > Request handling > Support invisible proxying"))
+            print(dim("    Fiddler: accepts non-proxy connections once 'Allow remote computers to connect' is on"))
+        else:
+            warn("iptables failed - is the device rooted (su available)?")
+
+    print(dim("\n  Cert: install your Burp/Fiddler CA on the device. Rooted -> put it in the"))
+    print(dim("  SYSTEM store so apps that ignore user certs still trust it. Undo: apkkit proxy off"))
+
+
 def cmd_merge(args):
     jar = resolve_apkeditor(args.apkeditor)
     if not jar:
@@ -2177,6 +2241,13 @@ def build_parser():
     sp = add("uninstall", "uninstall a package")
     sp.add_argument("package"); sp.set_defaults(func=cmd_uninstall)
 
+    sp = add("proxy", "point the device at Burp/Fiddler (global proxy + optional iptables)")
+    sp.add_argument("target", nargs="?",
+                    help="ip:port (or just a port -> emulator host 10.0.2.2), or 'off' / 'status'")
+    sp.add_argument("-t", "--transparent", action="store_true",
+                    help="also add iptables DNAT for 80/443 (ROOTED; catches proxy-ignoring apps like Flutter)")
+    sp.set_defaults(func=cmd_proxy)
+
     sp = add("flow", "pull -> merge -> (patch|gadget) -> install, one shot")
     sp.add_argument("package"); sp.add_argument("-o", "--out"); sp.add_argument("--apkeditor")
     sp.add_argument("--auto", action="store_true",
@@ -2659,6 +2730,21 @@ def act_config():
 
 
 # ---- submenus ------------------------------------------------------------ #
+def act_proxy():
+    box("Device proxy for Burp / Fiddler")
+    print("  " + mag("1") + ". set proxy    " + mag("2") + ". clear (off)    " + mag("3") + ". status")
+    c = ask("choose", "1")
+    if c == "2":
+        return cmd_proxy(A(target="off"))
+    if c == "3":
+        return cmd_proxy(A(target="status"))
+    tgt = ask("proxy ip:port (or just a port for an emulator)")
+    if not tgt:
+        return warn("nothing entered.")
+    tr = ask_yn("also add iptables transparent redirect? (ROOTED; for Flutter/proxy-ignoring apps)", False)
+    cmd_proxy(A(target=tgt, transparent=tr))
+
+
 @submenu
 def menu_device():
     run_menu("Device & packages", [
@@ -2666,6 +2752,7 @@ def menu_device():
         ("List packages", "user apps (Google/Samsung hidden)",
          lambda: cmd_list(A(vendor=False, system=False, grep=ask("filter (blank=all)") or None))),
         ("Pull app(s)", "grab base + split APKs off the device", act_pull),
+        ("Proxy (Burp/Fiddler)", "set/clear device proxy + iptables redirect", act_proxy),
     ])
 
 
