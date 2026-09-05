@@ -1926,18 +1926,15 @@ def _elf_vaddr_to_off(data, vaddr):
 
 
 def _zip_replace(src_apk, out_apk, entry_name, new_bytes):
-    """Copy src_apk to out_apk, replacing one entry's bytes."""
+    """Copy src_apk to out_apk, replacing one entry's bytes and PRESERVING each
+    entry's original compression (resources.arsc and *.so must stay STORED for
+    Android R+, or install fails with -124)."""
     zin = zipfile.ZipFile(src_apk, "r")
-    zout = zipfile.ZipFile(out_apk, "w", zipfile.ZIP_DEFLATED)
+    zout = zipfile.ZipFile(out_apk, "w")
     try:
         for item in zin.infolist():
             data = new_bytes if item.filename == entry_name else zin.read(item.filename)
-            # keep .so stored (uncompressed) like modern apks do; others deflate
-            ct = zipfile.ZIP_STORED if item.filename.endswith(".so") else zipfile.ZIP_DEFLATED
-            zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
-            zi.external_attr = item.external_attr
-            zi.compress_type = ct
-            zout.writestr(zi, data)
+            zout.writestr(item, data)   # item keeps its original compress_type
     finally:
         zin.close()
         zout.close()
