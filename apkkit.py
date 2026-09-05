@@ -1592,9 +1592,17 @@ def cmd_flow(args):
     if args.no_patch:
         method = "none"
     elif args.auto:
-        method = "reflutter" if flut else "gadget"
-        info("auto-selected: " + bold(method) +
-             (dim("  (Flutter TLS needs reFlutter)") if flut else dim("  (unrooted MITM via Frida gadget)")))
+        if flut:
+            method = "reflutter"
+            info("auto-selected: " + bold("reflutter") + dim("  (Flutter TLS needs reFlutter)"))
+        else:
+            # Native: prefer apk-mitm - a static patch, so the app just launches
+            # normally (no Frida attach). Gadget is only for active instrumentation.
+            method = "apk-mitm" if resolve_apkmitm() else "gadget"
+            info("auto-selected: " + bold(method) +
+                 (dim("  (static pinning strip - app runs normally, no Frida)")
+                  if method == "apk-mitm"
+                  else dim("  (apk-mitm not found; using Frida gadget instead)")))
     elif args.gadget:
         method = "gadget"
     else:
