@@ -1558,6 +1558,44 @@ def _flow_gadget(merged, serial, no_nsc):
     return cand
 
 
+def _static_flutter_patch(apk):
+    """Static libflutter.so TLS bypass (auto-detect). Returns a signed apk, or None."""
+    z = _open_apk(apk)
+    if "lib/arm64-v8a/libflutter.so" not in z.namelist():
+        z.close()
+        return None
+    so = z.read("lib/arm64-v8a/libflutter.so")
+    z.close()
+    foff = _auto_find_flutter_ssl(so)
+    if foff is None or foff + 8 > len(so):
+        return None
+    info("static patch: ssl_verify_peer_cert @ file off " + hex(foff))
+    patch = bytes([0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6])   # mov w0,#0 ; ret
+    out = _base(apk) + "-flutterpatched.apk"
+    _zip_replace(apk, out, "lib/arm64-v8a/libflutter.so", so[:foff] + patch + so[foff + 8:])
+    cmd_sign(A(apk=out, keystore=None))
+    signed = _base(out) + "-aligned-debugSigned.apk"
+    return signed if os.path.isfile(signed) else out
+
+
+def _flow_reflutter(merged):
+    """Run reFlutter, sign the result. Returns a signed apk, or None."""
+    if not have("reflutter"):
+        hint("reflutter")
+        return None
+    info("reFlutter will ask for your proxy IP (traffic -> that IP on :8083).")
+    run_live(["reflutter", merged])
+    cands = []
+    for d in {os.getcwd(), os.path.dirname(os.path.abspath(merged))}:
+        cands += glob.glob(os.path.join(d, "*.RE.apk"))
+    if not cands:
+        return None
+    out = sorted(cands)[0]
+    cmd_sign(A(apk=out, keystore=None))
+    signed = _base(out) + "-aligned-debugSigned.apk"
+    return signed if os.path.isfile(signed) else out
+
+
 def cmd_flow(args):
     serial = resolve_serial(args)
     pkg = args.package
@@ -1589,71 +1627,52 @@ def cmd_flow(args):
     flut = is_flutter(merged)
     print("  " + dim("app type: ") + (mag("Flutter (Dart)") if flut else grn("native Java/Kotlin")))
 
-    # choose the patch method
+    # pick + run the patch method
     if args.no_patch:
         method = "none"
-    elif args.auto:
-        if flut:
-            method = "reflutter"
-            info("auto-selected: " + bold("reflutter") + dim("  (Flutter TLS needs reFlutter)"))
-        else:
-            # Native: prefer apk-mitm - a static patch, so the app just launches
-            # normally (no Frida attach). Gadget is only for active instrumentation.
-            method = "apk-mitm" if resolve_apkmitm() else "gadget"
-            info("auto-selected: " + bold(method) +
-                 (dim("  (static pinning strip - app runs normally, no Frida)")
-                  if method == "apk-mitm"
-                  else dim("  (apk-mitm not found; using Frida gadget instead)")))
+        info("skipping patch (--no-patch).")
     elif args.gadget:
         method = "gadget"
-    else:
-        method = "apk-mitm"
-
-    if flut and method == "apk-mitm":
-        warn("apk-mitm can't intercept Flutter traffic - switching to reFlutter.")
-        method = "reflutter"
-    if flut and method == "gadget":
-        warn("gadget lets you run Frida, but Flutter TLS won't be intercepted - "
-             "use reFlutter for traffic.")
-
-    if method == "gadget":
         final = _flow_gadget(merged, serial, args.no_nsc)
-    elif method == "reflutter":
-        if not have("reflutter"):
-            warn("reflutter not installed - skipping patch.")
-            hint("reflutter")
+    elif flut:
+        # Flutter chain, least-invasive first:
+        #   1) static libflutter patch (no Frida, no root)   2) reFlutter   3) gadget
+        info("Flutter: trying static libflutter TLS patch (no Frida, no root) ...")
+        r = _static_flutter_patch(merged)
+        if r:
+            method = "flutter-patch"
+            final = r
+            ok("static patch done: " + r)
         else:
-            info("reFlutter will ask for your proxy IP (traffic -> that IP on :8083).")
-            run_live(["reflutter", merged])
-            cands = []
-            for d in {os.getcwd(), os.path.dirname(os.path.abspath(merged))}:
-                cands += glob.glob(os.path.join(d, "*.RE.apk"))
-            if cands:
-                final = sorted(cands)[0]
-                ok("reFlutter patched: " + final)
-                cmd_sign(A(apk=final, keystore=None))
-                signed = _base(final) + "-aligned-debugSigned.apk"
-                if os.path.isfile(signed):
-                    final = signed
+            warn("static patch couldn't auto-locate ssl_verify (new build or no arm64 lib).")
+            info("trying reFlutter ...")
+            r = _flow_reflutter(merged)
+            if r:
+                method = "reflutter"
+                final = r
+                ok("reFlutter patched: " + r)
             else:
-                warn("reFlutter can't patch this app's engine (unsupported/debug snapshot).")
-                info("falling back to Frida gadget so you still get an instrumentable build.")
-                info("for traffic you'll need a Flutter TLS bypass - see the notes after this run.")
-                final = _flow_gadget(merged, serial, args.no_nsc)
+                warn("reFlutter unavailable / can't patch this engine - falling back to gadget.")
                 method = "gadget-fallback"
-    elif method == "none":
-        info("skipping patch (--no-patch).")
+                final = _flow_gadget(merged, serial, args.no_nsc)
     else:
+        # Native: apk-mitm (static, app launches normally, no Frida). Gadget only as fallback.
         runner = resolve_apkmitm()
-        if not runner:
-            warn("apk-mitm not found - skipping patch.")
-            hint("apk-mitm")
-        else:
+        if runner:
+            method = "apk-mitm"
+            info("native: apk-mitm static pinning strip (no Frida) ...")
             run_live(runner + [merged])
             cand = _base(merged) + "-patched.apk"
             if os.path.isfile(cand):
                 final = cand
                 ok("patched: " + cand)
+            else:
+                warn("apk-mitm produced no output; using merged apk.")
+        else:
+            method = "gadget"
+            warn("apk-mitm not found - using Frida gadget instead.")
+            hint("apk-mitm")
+            final = _flow_gadget(merged, serial, args.no_nsc)
 
     # never try to install an unsigned apk (raw APKEditor output won't verify)
     if args.install and not (final.endswith("Signed.apk") or final.endswith("-patched.apk")):
@@ -1676,12 +1695,17 @@ def cmd_flow(args):
 
     hdr("Flow complete")
     print("  final apk: " + bold(final))
-    if method in ("gadget", "gadget-fallback"):
-        print(dim("  Attach Frida: ") + "apkkit hook Gadget --gadget --builtin ssl")
-        if method == "gadget-fallback":
-            print(dim("  (Flutter app: for TRAFFIC you need a Flutter TLS bypass, not the Java ssl script.)"))
+    if method == "flutter-patch":
+        print(dim("  Frida-free: set a device proxy + install your CA - the app trusts any cert now."))
+        print(dim("  If it self-closes on launch, it has tamper detection (a TLS patch can't fix that)."))
+    elif method == "apk-mitm":
+        print(dim("  Set a device proxy + install the apk-mitm CA - no Frida needed."))
     elif method == "reflutter":
         print(dim("  Set the device proxy to <your-ip>:8083 and watch traffic in Burp."))
+    elif method in ("gadget", "gadget-fallback"):
+        print(dim("  Attach Frida: ") + "apkkit hook Gadget --gadget --builtin ssl")
+        if method == "gadget-fallback":
+            print(dim("  (Flutter: for TRAFFIC use --builtin flutter-ssl, not the Java ssl script.)"))
 
 
 # --------------------------------------------------------------------------- #
@@ -2131,7 +2155,7 @@ def build_parser():
     sp = add("flow", "pull -> merge -> (patch|gadget) -> install, one shot")
     sp.add_argument("package"); sp.add_argument("-o", "--out"); sp.add_argument("--apkeditor")
     sp.add_argument("--auto", action="store_true",
-                    help="pick the patch method from the app type (native->gadget, Flutter->reFlutter)")
+                    help="(default) pick patch by app type: native->apk-mitm, Flutter->static patch")
     sp.add_argument("--gadget", action="store_true", help="inject Frida gadget instead of apk-mitm")
     sp.add_argument("--no-patch", action="store_true", help="skip patching entirely")
     sp.add_argument("--no-nsc", action="store_true", help="(gadget) don't add network-security-config")
@@ -2504,7 +2528,7 @@ def act_flow():
         if not pkg:
             return warn("no package chosen.")
     do_install = ask_yn("reinstall the result on the device?", True)
-    info("patch method will be auto-picked from the app type (native → gadget, Flutter → reFlutter).")
+    info("auto by app type: native → apk-mitm, Flutter → static libflutter patch (no Frida/root).")
     cmd_flow(A(package=pkg, serial=serial, out=None, auto=True, gadget=False,
                no_patch=False, no_nsc=False, install=do_install, grant=False))
 
