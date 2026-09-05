@@ -1919,6 +1919,98 @@ def _zip_replace(src_apk, out_apk, entry_name, new_bytes):
         zout.close()
 
 
+# Masked byte signatures for ssl_verify_peer_cert (Android arm64), sourced from
+# NVISO's disable-flutter-tls-verification project. Used to auto-locate the
+# function for a static patch. Credit: https://github.com/NVISOsecurity/disable-flutter-tls-verification
+FLUTTER_SSL_PATTERNS_ARM64 = [
+    "F? 0F 1C F8 F? 5? 01 A9 F? 5? 02 A9 F? ?? 03 A9 ?? ?? ?? ?? 68 1A 40 F9",
+    "F? 43 01 D1 FE 67 01 A9 F8 5F 02 A9 F6 57 03 A9 F4 4F 04 A9 13 00 40 F9 F4 03 00 AA 68 1A 40 F9",
+    "FF 43 01 D1 FE 67 01 A9 ?? ?? 06 94 ?? 7? 06 94 68 1A 40 F9 15 15 41 F9 B5 00 00 B4 B6 4A 40 F9",
+    "FF ?3 01 D1 F? ?? 01 A9 ?? ?? ?? 94 ?? ?? ?? 52 48 00 00 39 1A 50 40 F9 DA 02 00 B4 48 03 40 F9",
+]
+
+
+def _parse_masked_pattern(patstr):
+    """'F? 43 ?? D1' -> (values bytes, masks bytes), nibble-aware."""
+    vals, masks = bytearray(), bytearray()
+    for tok in patstr.split():
+        v = m = 0
+        if tok[0] != "?":
+            v |= int(tok[0], 16) << 4; m |= 0xF0
+        if tok[1] != "?":
+            v |= int(tok[1], 16); m |= 0x0F
+        vals.append(v); masks.append(m)
+    return bytes(vals), bytes(masks)
+
+
+def _exec_ranges(data):
+    """File [start,end) ranges of executable PT_LOAD segments (PF_X)."""
+    ranges = []
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return [(0, len(data))]
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for i in range(e_phnum):
+        b = e_phoff + i * e_phentsize
+        if struct.unpack_from("<I", data, b)[0] != 1:            # PT_LOAD
+            continue
+        p_flags = struct.unpack_from("<I", data, b + 4)[0]
+        if not (p_flags & 0x1):                                  # PF_X
+            continue
+        p_offset = struct.unpack_from("<Q", data, b + 8)[0]
+        p_filesz = struct.unpack_from("<Q", data, b + 0x20)[0]
+        ranges.append((p_offset, p_offset + p_filesz))
+    return ranges or [(0, len(data))]
+
+
+def _scan_pattern(data, vals, masks, start, end):
+    """Return file offsets in [start,end) where the masked pattern matches."""
+    n = len(vals)
+    # anchor on the longest run of fully-fixed bytes for a fast bytes.find
+    best_i = best_len = 0
+    i = 0
+    while i < n:
+        if masks[i] == 0xFF:
+            j = i
+            while j < n and masks[j] == 0xFF:
+                j += 1
+            if j - i > best_len:
+                best_len, best_i = j - i, i
+            i = j
+        else:
+            i += 1
+    anchor = vals[best_i:best_i + best_len]
+    hits = []
+    pos = start
+    while True:
+        idx = data.find(anchor, pos, end)
+        if idx < 0:
+            break
+        cand = idx - best_i
+        if cand >= start and cand + n <= end:
+            if all((data[cand + k] & masks[k]) == vals[k] for k in range(n)):
+                hits.append(cand)
+        pos = idx + 1
+    return hits
+
+
+def _auto_find_flutter_ssl(so):
+    """Auto-locate ssl_verify_peer_cert file offset in libflutter.so, or None."""
+    ranges = _exec_ranges(so)
+    fallback = None
+    for patstr in FLUTTER_SSL_PATTERNS_ARM64:
+        vals, masks = _parse_masked_pattern(patstr)
+        hits = []
+        for (a, b) in ranges:
+            hits += _scan_pattern(so, vals, masks, a, b)
+        if len(hits) == 1:
+            return hits[0]                 # unambiguous - best case
+        if hits and fallback is None:
+            fallback = hits[0]
+    return fallback
+
+
 def cmd_flutter_patch(args):
     """Static Flutter TLS bypass: NOP ssl_verify_peer_cert in libflutter.so. No Frida, no root."""
     apk = args.apk
@@ -1935,21 +2027,28 @@ def cmd_flutter_patch(args):
     so = z.read(target)
     z.close()
 
-    if not args.offset:
-        die("Need --offset. Get it by running the Frida bypass once - it prints\n"
-            "      '[+] ssl_verify_peer_cert found at offset: 0x...':\n"
-            "        apkkit hook <pkg> --gadget --builtin flutter-ssl\n"
-            "      then: apkkit flutter-patch " + _quote(apk) + " --offset 0xXXXXXX")
-    try:
-        vaddr = int(args.offset, 16) if isinstance(args.offset, str) else int(args.offset)
-    except ValueError:
-        die("--offset must be hex like 0x753dc8")
+    if args.offset:
+        try:
+            vaddr = int(args.offset, 16) if isinstance(args.offset, str) else int(args.offset)
+        except ValueError:
+            die("--offset must be hex like 0x753dc8")
+        foff = _elf_vaddr_to_off(so, vaddr)
+        if foff is None or foff + 8 > len(so):
+            die("Offset " + hex(vaddr) + " doesn't map into libflutter.so - right value/app?")
+        info("using supplied offset " + hex(vaddr) + " (file off " + hex(foff) + ")")
+    else:
+        info("auto-detecting ssl_verify_peer_cert (NVISO arm64 signatures) ...")
+        foff = _auto_find_flutter_ssl(so)
+        if foff is None:
+            die("Couldn't auto-detect the function (new/unusual Flutter build).\n"
+                "      Get the offset from a live run and pass it:\n"
+                "        apkkit hook <pkg> --gadget --builtin flutter-ssl   (prints the offset)\n"
+                "        apkkit flutter-patch " + _quote(apk) + " --offset 0xXXXXXX")
+        if foff + 8 > len(so):
+            die("auto-detected offset out of range - pass --offset manually.")
+        ok("auto-detected ssl_verify_peer_cert at file offset " + hex(foff))
 
-    foff = _elf_vaddr_to_off(so, vaddr)
-    if foff is None or foff + 8 > len(so):
-        die("Offset " + hex(vaddr) + " doesn't map into libflutter.so - is it the right value/app?")
-
-    hdr("Static Flutter TLS patch @ " + hex(vaddr) + "  (file off " + hex(foff) + ")")
+    hdr("Static Flutter TLS patch  (file off " + hex(foff) + ")")
     # arm64: mov w0, #0 (ssl_verify_ok) ; ret
     patch = bytes([0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6])
     info("original bytes: " + so[foff:foff + 8].hex() + "  ->  " + patch.hex())
@@ -2110,7 +2209,7 @@ def build_parser():
 
     sp = add("flutter-patch", "Flutter: static libflutter.so TLS bypass (no Frida, no root)")
     sp.add_argument("apk", help="a merged .apk")
-    sp.add_argument("--offset", help="ssl_verify_peer_cert offset, e.g. 0x753dc8 (from flutter-ssl run)")
+    sp.add_argument("--offset", help="ssl_verify_peer_cert offset (optional; auto-detected if omitted)")
     sp.set_defaults(func=cmd_flutter_patch)
 
     sp = add("doctor", "check external tools + show install steps")
@@ -2549,7 +2648,7 @@ def act_reflutter():
 def act_flutter_patch():
     box("Static Flutter TLS patch (no Frida / no root)")
     apk = ask_target("merged apk")
-    off = ask("ssl_verify_peer_cert offset (0x… from a flutter-ssl run)")
+    off = ask("ssl_verify offset (blank = auto-detect)")
     cmd_flutter_patch(A(apk=apk, offset=off or None))
 
 
