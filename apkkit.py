@@ -36,6 +36,7 @@ Housekeeping:
     devices   list attached devices
     logcat    stream filtered logcat (why does an app self-close?)
     checks    find root/emulator/tamper checks in smali (+--neutralize)
+    data      grep an app's shared_prefs / db / files via su (ROOTED)
     mitm      one-shot pull->patch->install->cert->proxy->launch
     emulator  list / launch AVDs with RE-friendly flags
     batch     classify / libs / scan across all pulled apps
@@ -68,11 +69,41 @@ import urllib.request
 import lzma
 import zipfile
 
-__version__ = "0.4"
+__version__ = "0.4.3"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
-DEFAULT_PULL_DIR = os.path.join(os.getcwd(), "pulled_apks")
+def _script_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def work_dir():
+    """Stable, writable base for all generated output (pulls, merges, patches).
+    Order: config 'workdir' > $APKKIT_WORK > apkkit.py's own dir > ~/apkkit.
+    Never the current dir - so `apkkit` works even when launched from system32."""
+    for c in (CONFIG.get("workdir"), os.environ.get("APKKIT_WORK")):
+        if c:
+            try:
+                os.makedirs(c, exist_ok=True)
+            except Exception:
+                pass
+            return c
+    base = _script_dir()
+    if not os.access(base, os.W_OK):
+        base = os.path.join(HOME, "apkkit")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        base = os.path.join(HOME, "apkkit")
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+def pull_dir():
+    return os.path.join(work_dir(), "pulled_apks")
 SCRIPTS_DIR = os.path.join(HOME, ".apkkit", "scripts")
 CACHE_DIR = os.path.join(HOME, ".apkkit", "cache")
 
@@ -299,10 +330,10 @@ def _su(serial, command):
     return ["adb", "-s", serial, "shell", "su -c '" + command + "'"]
 
 
-def run_live(cmd, env=None):
+def run_live(cmd, env=None, cwd=None):
     print(dim("  $ " + " ".join(_quote(a) for a in cmd)))
     try:
-        return subprocess.run(cmd, env=env).returncode
+        return subprocess.run(cmd, env=env, cwd=cwd).returncode
     except FileNotFoundError:
         erro("Not found: " + cmd[0])
         return 127
@@ -570,7 +601,7 @@ def _pull_one(serial, pkg, out_dir):
 
 def cmd_pull(args):
     serial = resolve_serial(args)
-    out_dir = args.out or DEFAULT_PULL_DIR
+    out_dir = args.out or pull_dir()
     if args.packages:
         results = [_pull_one(serial, p, out_dir) for p in args.packages]
         _print_pull_footer([r for r in results if r])
@@ -920,7 +951,7 @@ def cmd_gadget(args):
         cmd += ["-c", args.startup_script]
     if args.skip_resources:
         cmd.append("--skip-resources")
-    rc = run_live(cmd)
+    rc = run_live(cmd, cwd=os.path.dirname(os.path.abspath(apk)))
     out = _base(apk) + ".objection.apk"
     if os.path.isfile(out):
         ok("patched apk: " + out)
@@ -956,28 +987,38 @@ def cmd_frida_ps(args):
 def cmd_hook(args):
     if not have("frida"):
         need("python-frida", "frida")
-    script = args.script
-    if args.builtin:
-        script = _ensure_builtin_script(args.builtin)
-        info("using built-in script: " + script)
-    if not script or not os.path.isfile(script):
-        die("No script to run. Pass -l <script.js> or --builtin ssl|root|trace.")
+    # collect one or more scripts: built-ins first, then explicit -l paths
+    scripts = []
+    for b in (args.builtin or []):
+        scripts.append(_ensure_builtin_script(b))
+    for s in (args.script or []):
+        scripts.append(s)
+    scripts = [s for s in scripts if s]
+    missing = [s for s in scripts if not os.path.isfile(s)]
+    if missing:
+        die("Script not found: " + ", ".join(missing))
+    if not scripts:
+        die("No script to run. Pass -l <script.js> (repeatable) or --builtin ssl|root|...")
 
     target = args.target
     serial = resolve_serial(args)
-    hdr("Frida hook: " + target)
+    hdr("Frida hook: " + target + ("  (" + str(len(scripts)) + " scripts)" if len(scripts) > 1 else ""))
+    lflags = []
+    for s in scripts:
+        lflags += ["-l", s]
     base = ["frida", "-D", serial]
     if args.gadget:
-        # gadget is already running inside the app; attach by its name (Gadget)
-        cmd = base + [target, "-l", script]
+        cmd = base + [target] + lflags
         info("attaching to gadget process '" + target + "'")
     elif args.attach:
-        cmd = base + ["-n", target, "-l", script]
+        cmd = base + ["-n", target] + lflags
         info("attaching to running process by name")
     else:
-        cmd = base + ["-f", target, "-l", script]
+        cmd = base + ["-f", target] + lflags
         info("spawning package and injecting at startup")
         info("(Frida 17 auto-resumes; if it sits at the prompt, type %resume)")
+    for s in scripts:
+        info("script: " + s)
     print(dim("  (Ctrl+C / 'exit' to detach)\n"))
     run_live(cmd)
 
@@ -1824,13 +1865,14 @@ def cmd_doctor(args):
             hint(key)
     else:
         ok("all tools present - you're fully loaded.")
-    print(dim("\n  config: " + CONFIG_PATH + (" (present)" if os.path.isfile(CONFIG_PATH) else " (none yet)")))
+    print(dim("\n  config:  " + CONFIG_PATH + (" (present)" if os.path.isfile(CONFIG_PATH) else " (none yet)")))
     print(dim("  scripts: " + SCRIPTS_DIR))
+    print(dim("  workdir: " + work_dir() + "   (pulls/merges/patches land here)"))
 
 
 def cmd_config(args):
     changed = False
-    for attr, key in (("apkeditor", "apkeditor"), ("aapt", "aapt"), ("uber", "uber"), ("blutter", "blutter")):
+    for attr, key in (("apkeditor", "apkeditor"), ("aapt", "aapt"), ("uber", "uber"), ("blutter", "blutter"), ("workdir", "workdir")):
         val = getattr(args, attr, None)
         if val:
             CONFIG[key] = os.path.abspath(val)
@@ -1855,7 +1897,7 @@ def _flow_gadget(merged, serial, no_nsc):
     cmd = ["objection", "patchapk", "-s", merged, "-a", device_abi(serial)]
     if not no_nsc:
         cmd.append("-N")
-    run_live(cmd)
+    run_live(cmd, cwd=os.path.dirname(os.path.abspath(merged)))
     cand = _base(merged) + ".objection.apk"
     if not os.path.isfile(cand):
         warn("no *.objection.apk produced; using merged apk.")
@@ -1889,9 +1931,9 @@ def _flow_reflutter(merged):
         hint("reflutter")
         return None
     info("reFlutter will ask for your proxy IP (traffic -> that IP on :8083).")
-    run_live(["reflutter", merged])
+    run_live(["reflutter", merged], cwd=os.path.dirname(os.path.abspath(merged)))
     cands = []
-    for d in {os.getcwd(), os.path.dirname(os.path.abspath(merged))}:
+    for d in {os.path.dirname(os.path.abspath(merged)), work_dir()}:
         cands += glob.glob(os.path.join(d, "*.RE.apk"))
     if not cands:
         return None
@@ -1972,7 +2014,7 @@ def _apply_patch(choice, merged, flut, serial, args):
 def cmd_flow(args):
     serial = resolve_serial(args)
     pkg = args.package
-    out_dir = args.out or DEFAULT_PULL_DIR
+    out_dir = args.out or pull_dir()
     mode = "none" if args.no_patch else ("gadget" if args.gadget else (args.method or "auto"))
     total = 3 + (1 if args.install else 0)
 
@@ -1989,7 +2031,7 @@ def cmd_flow(args):
         need("apkeditor", "APKEditor.jar")
     if not have("java"):
         need("java")
-    merged = os.path.join(os.getcwd(), pkg + "-merged.apk")
+    merged = os.path.join(work_dir(), pkg + "-merged.apk")
     if run_live(["java", "-jar", jar, "m", "-i", dest, "-o", merged, "-f"]) != 0 \
             or not os.path.isfile(merged):
         die("merge failed.")
@@ -2221,9 +2263,9 @@ def cmd_reflutter(args):
     hdr("reFlutter: patch for HTTPS interception")
     info("reFlutter will ask for your Burp/proxy IP. Patched traffic -> that IP on port 8083.")
     print(dim("  Note: Flutter >= 3.24 drops the baked-in proxy; also set a device proxy manually."))
-    rc = run_live(["reflutter", apk])
+    rc = run_live(["reflutter", apk], cwd=os.path.dirname(os.path.abspath(apk)))
     cands = []
-    for d in {os.getcwd(), os.path.dirname(os.path.abspath(apk))}:
+    for d in {os.path.dirname(os.path.abspath(apk)), work_dir()}:
         cands += glob.glob(os.path.join(d, "*.RE.apk"))
     out = sorted(cands)[0] if cands else None
     if not out:
@@ -2646,7 +2688,7 @@ def cmd_emulator(args):
 
 def cmd_batch(args):
     """Run an inspection across every app folder / apk under a directory."""
-    root = args.dir or DEFAULT_PULL_DIR
+    root = args.dir or pull_dir()
     if not os.path.isdir(root):
         die("Not a directory: " + root + "  (pull some apps first, or pass --dir)")
     targets = []
@@ -2701,6 +2743,69 @@ def cmd_update(args):
         need("git") if "git" in INSTALL_HINTS else die("git not found.")
     hdr("Updating apkkit (git pull) in " + here)
     run_live(["git", "-C", here, "pull", "--ff-only"])
+
+
+DATA_GREP_DEFAULT = ("push|token|registration|moengage|fcm|gcm|firebase|"
+                     "secret|password|passwd|api[_-]?key|apikey|auth|bearer|jwt|"
+                     "session|refresh|client_secret|device_id|deviceid|uuid")
+
+
+def _su_ok(serial):
+    """True if Magisk su grants root to the shell."""
+    rc, out, _ = adb(["shell", "su -c 'id -u'"], serial=serial)
+    return rc == 0 and out.strip().splitlines()[-1:] == ["0"]
+
+
+def cmd_data(args):
+    """Inspect an app's /data/data/<pkg> via Magisk su (shared_prefs, databases, files)."""
+    if not have("adb"):
+        need("adb")
+    serial = resolve_serial(args)
+    pkg = args.package
+    base = "/data/data/" + pkg
+
+    if not _su_ok(serial):
+        erro("root (su) not available to the shell on " + serial + ".")
+        print(dim("  'adb root' can't work on Play/production images - root comes from Magisk."))
+        print(dim("  Open Magisk on the device, grant su to 'shell', then retry."))
+        print(dim("  (run-as only works on debuggable apps, which production apps aren't.)"))
+        return
+
+    # confirm the app has a data dir
+    rc, out, _ = adb(["shell", "su -c 'ls -d " + base + "'"], serial=serial)
+    if rc != 0 or "No such" in out or not out.strip():
+        die("No data dir for " + pkg + " (is it installed? has it been launched once?)")
+
+    if args.pull:
+        dest = args.out or os.path.join(work_dir(), pkg + "_data")
+        tmp = "/data/local/tmp/" + pkg + "_data"
+        hdr("Pull app data -> " + dest)
+        run_live(_su(serial, "rm -rf " + tmp + "; cp -a " + base + " " + tmp +
+                             " 2>/dev/null; chmod -R 777 " + tmp))
+        os.makedirs(dest, exist_ok=True)
+        run_live(["adb", "-s", serial, "pull", tmp, dest])
+        run_live(_su(serial, "rm -rf " + tmp))
+        ok("pulled to " + dest + "  (grep it with: apkkit scan / your editor)")
+        return
+
+    if args.list:
+        hdr("Data tree: " + base)
+        run_live(_su(serial, "ls -laR " + base + " 2>/dev/null"))
+        return
+
+    if args.prefs:
+        hdr("shared_prefs: " + pkg)
+        run_live(_su(serial, "for f in " + base + "/shared_prefs/*.xml; do "
+                             "echo; echo \"==== $f ====\"; cat \"$f\"; done"))
+        return
+
+    # default / --grep: search the text-y parts of the data dir
+    rx = args.grep or DATA_GREP_DEFAULT
+    hdr("grep " + pkg + " data  ~ /" + rx + "/")
+    for sub in ("shared_prefs", "files", "no_backup"):
+        run_live(_su(serial, "grep -rniE \"" + rx + "\" " + base + "/" + sub + " 2>/dev/null"))
+    info("databases (pull + open in a viewer, or use `apkkit data " + pkg + " --pull`):")
+    run_live(_su(serial, "ls -la " + base + "/databases 2>/dev/null"))
 
 
 def build_parser():
@@ -2806,10 +2911,11 @@ def build_parser():
 
     sp = add("hook", "run a Frida script (spawn / attach / gadget)")
     sp.add_argument("target", help="package name, process name, or 'Gadget'")
-    sp.add_argument("-l", "--script", help="path to a Frida JS script")
-    sp.add_argument("--builtin",
+    sp.add_argument("-l", "--script", action="append", metavar="SCRIPT",
+                    help="Frida JS script (repeat -l to load several)")
+    sp.add_argument("--builtin", action="append",
                     choices=["ssl", "root", "trace", "flutter-ssl", "webview", "sqlite", "crypto"],
-                    help="bundled script (flutter-ssl needs the NVISO script)")
+                    help="bundled script (repeatable; flutter-ssl needs the NVISO script)")
     sp.add_argument("--attach", action="store_true", help="attach by process name (-n)")
     sp.add_argument("--gadget", action="store_true", help="attach to a gadget-patched app")
     sp.set_defaults(func=cmd_hook)
@@ -2908,6 +3014,15 @@ def build_parser():
     sp = add("update", "self-update: git pull the apkkit checkout")
     sp.set_defaults(func=cmd_update)
 
+    sp = add("data", "inspect an app's /data/data (shared_prefs/db/files) via su - ROOTED")
+    sp.add_argument("package")
+    sp.add_argument("-g", "--grep", help="regex to search (default: common secret keys)")
+    sp.add_argument("--prefs", action="store_true", help="dump all shared_prefs xml")
+    sp.add_argument("--list", action="store_true", help="recursive listing of the data dir")
+    sp.add_argument("--pull", action="store_true", help="copy the whole data dir to your work dir")
+    sp.add_argument("-o", "--out", help="pull destination")
+    sp.set_defaults(func=cmd_data)
+
     sp = add("doctor", "check external tools + show install steps")
     sp.add_argument("--json", action="store_true", help="machine-readable tool status")
     sp.set_defaults(func=cmd_doctor)
@@ -2915,6 +3030,7 @@ def build_parser():
     sp = add("config", "show / set saved tool paths")
     sp.add_argument("--apkeditor"); sp.add_argument("--aapt"); sp.add_argument("--uber")
     sp.add_argument("--blutter", help="path to blutter.py")
+    sp.add_argument("--workdir", help="where pulls/merges/patches are written (default: apkkit's own folder)")
     sp.set_defaults(func=cmd_config)
 
     return p
@@ -2967,13 +3083,13 @@ def ask_yn(q, default=False):
 def _browsable():
     """Folders under ./pulled_apks + loose .apk files in the current dir."""
     items = []
-    pull = os.path.join(os.getcwd(), "pulled_apks")
+    pull = pull_dir()
     if os.path.isdir(pull):
         for name in sorted(os.listdir(pull)):
             p = os.path.join(pull, name)
             if os.path.isdir(p):
                 items.append(p)
-    items += sorted(glob.glob(os.path.join(os.getcwd(), "*.apk")))
+    items += sorted(glob.glob(os.path.join(work_dir(), "*.apk")))
     return items
 
 
@@ -3114,16 +3230,23 @@ def pick_script():
     for j, f in enumerate(customs, len(builtins) + 1):
         print("  " + mag(str(j)) + ". " + f)
     print("  " + mag("p") + ". type a custom path")
-    c = ask("script")
-    if c == "p":
-        return None, ask("path to .js")
-    if c.isdigit():
-        n = int(c)
-        if 1 <= n <= len(builtins):
-            return builtins[n - 1][0], None            # builtin key
-        if len(builtins) < n <= len(builtins) + len(customs):
-            return None, os.path.join(SCRIPTS_DIR, customs[n - len(builtins) - 1])
-    return None, None
+    print(dim("  (pick one or several, comma-separated e.g. 1,3)"))
+    sel = ask("script(s)")
+    bkeys, paths = [], []
+    for tok in sel.replace(" ", "").split(","):
+        if not tok:
+            continue
+        if tok == "p":
+            pth = ask("path to .js")
+            if pth:
+                paths.append(pth)
+        elif tok.isdigit():
+            n = int(tok)
+            if 1 <= n <= len(builtins):
+                bkeys.append(builtins[n - 1][0])
+            elif len(builtins) < n <= len(builtins) + len(customs):
+                paths.append(os.path.join(SCRIPTS_DIR, customs[n - len(builtins) - 1]))
+    return bkeys, paths
 
 
 def add_custom_script_interactive():
@@ -3228,9 +3351,11 @@ def act_frida_ps():
 def act_hook():
     box("Run a Frida hook")
     target = ask("target (package, process name, or 'Gadget')", "Gadget")
-    builtin, path = pick_script()
+    bkeys, paths = pick_script()
+    if not bkeys and not paths:
+        return warn("no script chosen.")
     mode = ask("mode: [s]pawn  [a]ttach  [g]adget", "g").lower()
-    cmd_hook(A(target=target, script=path, builtin=builtin,
+    cmd_hook(A(target=target, script=paths, builtin=bkeys,
                attach=mode.startswith("a"), gadget=mode.startswith("g")))
 
 
@@ -3464,12 +3589,35 @@ def act_batch():
     cmd_batch(A(action=action, dir=d or None))
 
 
+def act_data():
+    box("App data (shared_prefs / db / files) - ROOTED")
+    serial = resolve_serial(A())
+    pkg = ask("package (blank = browse)")
+    if not pkg:
+        pkg = choose_package(serial)
+        if not pkg:
+            return warn("no package chosen.")
+    print("  " + mag("1") + ". grep secrets   " + mag("2") + ". dump shared_prefs   "
+          + mag("3") + ". list tree   " + mag("4") + ". pull all")
+    c = ask("choose", "1")
+    if c == "2":
+        cmd_data(A(package=pkg, serial=serial, prefs=True))
+    elif c == "3":
+        cmd_data(A(package=pkg, serial=serial, list=True))
+    elif c == "4":
+        cmd_data(A(package=pkg, serial=serial, pull=True))
+    else:
+        g = ask("grep regex (blank = default secret keys)")
+        cmd_data(A(package=pkg, serial=serial, grep=g or None))
+
+
 @submenu
 def menu_diag():
     run_menu("Diagnostics & analysis", [
         ("logcat", "stream filtered logs (why does it close?)", act_logcat),
         ("checks", "find root/emulator/tamper checks in smali", act_checks),
         ("batch", "classify / libs / scan across all pulled apps", act_batch),
+        ("app data", "shared_prefs / db / files grep (rooted)", act_data),
     ])
 
 
