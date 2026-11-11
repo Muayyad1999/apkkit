@@ -69,7 +69,7 @@ import urllib.request
 import lzma
 import zipfile
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
@@ -3192,7 +3192,9 @@ def build_parser():
 
     # shared options every subcommand accepts (so `apkkit install app.apk -s <serial>` works)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("-s", "--serial", help="target device serial")
+    # SUPPRESS so a per-subcommand default doesn't clobber a global `-s` given BEFORE
+    # the subcommand (e.g. `apkkit -s <serial> hosts <pkg>`), which matters with 2+ devices.
+    common.add_argument("-s", "--serial", default=argparse.SUPPRESS, help="target device serial")
 
     def add(name, help):
         return sub.add_parser(name, help=help, parents=[common])
