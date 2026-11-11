@@ -69,7 +69,7 @@ import urllib.request
 import lzma
 import zipfile
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
@@ -2686,6 +2686,377 @@ def cmd_emulator(args):
         erro("failed to launch: " + str(e))
 
 
+def cmd_netfix(args):
+    """Clear an emulator/device 'no internet' caused by failed captive-portal validation.
+
+    The network often has real connectivity (ping/DNS work) but Android's captive-portal
+    probe to generate_204 fails, so the net never gets the VALIDATED capability and the
+    system shows 'no internet'. Disable the probe and re-validate by toggling wifi.
+    """
+    import time
+    serial = resolve_serial(args)
+    if not serial:
+        return
+    hdr("Network fix (captive-portal) on " + serial)
+    for k, v in (("captive_portal_mode", "0"), ("captive_portal_detection_enabled", "0")):
+        adb(["shell", "settings", "put", "global", k, v], serial=serial)
+    adb(["shell", "settings", "put", "global", "captive_portal_http_url",
+         "http://connectivitycheck.gstatic.com/generate_204"], serial=serial)
+    info("captive-portal detection disabled")
+    info("re-validating network (wifi off/on) ...")
+    adb(["shell", "svc", "wifi", "disable"], serial=serial)
+    time.sleep(2)
+    adb(["shell", "svc", "wifi", "enable"], serial=serial)
+    time.sleep(5)
+    _, out, _ = adb(["shell", "dumpsys", "connectivity"], serial=serial)
+    if "IS_VALIDATED" in out:
+        ok("network VALIDATED - 'no internet' cleared")
+    else:
+        warn("not VALIDATED yet - wait a few seconds and re-run, or check the emulator")
+    print(dim("  persists across reboot, not across a wipe/cold-boot"))
+
+
+# --------------------------------------------------------------------------- #
+# dynamic TLS capture (friTap) + pcap decode + backend-host enumeration
+# --------------------------------------------------------------------------- #
+TRACKER_HOSTS = ("adjust", "moengage", "amplitude", "uxcam", "firebase", "google",
+                 "crashlytics", "sentry", "facebook", "appsflyer", "branch", "segment",
+                 "mixpanel", "bugsnag", "cloudfront", "doubleclick", "gstatic", "googleapis",
+                 "1e100", "crashlytics", "app-measurement", "unity3d", "onesignal")
+
+
+def _fritap_ok():
+    try:
+        p = subprocess.run([sys.executable, "-m", "friTap.friTap", "--version"],
+                           capture_output=True, text=True)
+        return ("friTap" in (p.stdout or "") + (p.stderr or "")) or p.returncode == 0
+    except Exception:
+        return False
+
+
+def _drive_ui(serial, stop):
+    """Background generic UI driver: scroll + tap a bottom nav bar to pull network."""
+    seq = [["swipe", "540", "1500", "540", "500", "300"],
+           ["tap", "965", "2048"], ["tap", "540", "2048"], ["tap", "753", "2048"],
+           ["tap", "327", "2048"], ["tap", "113", "2048"],
+           ["swipe", "540", "600", "540", "1700", "350"]]
+    time.sleep(12)
+    i = 0
+    while not stop.is_set():
+        adb(["shell", "input"] + seq[i % len(seq)], serial=serial)
+        i += 1
+        for _ in range(6):
+            if stop.is_set():
+                break
+            time.sleep(0.5)
+
+
+def cmd_sslcapture(args):
+    """friTap: spawn/attach an app, decrypt its TLS from inside the process, write a pcap.
+
+    Reads plaintext at SSL_read/SSL_write, so it defeats certificate pinning with NO
+    proxy. Flutter-aware (hooks libflutter's bundled BoringSSL + system libssl). Then
+    run `apkkit decode-pcap <file>` to read it.
+    """
+    import threading
+    if not _fritap_ok():
+        erro("friTap not installed.")
+        print(dim("  pip install friTap   (into the python that has frida: " + sys.executable + ")"))
+        return
+    serial = resolve_serial(args)
+    pkg = args.package
+    out = os.path.abspath(args.out or (re.sub(r"[^A-Za-z0-9._-]+", "_", pkg) + ".pcap"))
+    hdr("friTap TLS capture: " + pkg)
+    info("-> " + out)
+    if args.block_quic:
+        info("dropping UDP/443 so a QUIC/HTTP3 first-party channel falls back to TCP")
+        subprocess.run(_su(serial, "iptables -I OUTPUT -p udp --dport 443 -j DROP"), capture_output=True)
+        subprocess.run(_su(serial, "ip6tables -I OUTPUT -p udp --dport 443 -j DROP"), capture_output=True)
+    cmd = [sys.executable, "-m", "friTap.friTap", "-m", serial, "-v",
+           "--duration", str(args.duration), "--non-interactive", "-p", out]
+    if args.stealth:
+        cmd.append("--experimental-stealth-loader")
+    if not args.attach:
+        cmd.append("-s")          # spawn, hook at startup
+    cmd.append(pkg)
+    stop = threading.Event()
+    if args.drive:
+        info("auto-driving the UI during capture")
+        threading.Thread(target=_drive_ui, args=(serial, stop), daemon=True).start()
+    info("capturing ~" + str(args.duration) + "s ... (Ctrl+C to stop early)")
+    run_live(cmd)
+    stop.set()
+    if args.block_quic:
+        subprocess.run(_su(serial, "iptables -D OUTPUT -p udp --dport 443 -j DROP"), capture_output=True)
+        subprocess.run(_su(serial, "ip6tables -D OUTPUT -p udp --dport 443 -j DROP"), capture_output=True)
+    if os.path.isfile(out) and os.path.getsize(out) > 64:
+        ok("pcap: " + out + "  (" + "{:,}".format(os.path.getsize(out)) + " bytes)")
+        if args.decode:
+            print()
+            _decode_pcap(out, grep=None, bodies=args.bodies)
+    else:
+        warn("no usable pcap (friTap may not have matched this build, or no TLS flowed)")
+        print(dim("  try: --block-quic (force TCP), --drive (generate traffic), or --attach"))
+
+
+def _decode_pcap(path, grep=None, bodies=False):
+    try:
+        from scapy.all import rdpcap, IP, TCP
+        from hpack import Decoder
+    except Exception:
+        erro("need scapy + hpack:  pip install scapy hpack")
+        return
+    import gzip
+    import zlib
+    from collections import OrderedDict, defaultdict
+    try:
+        pkts = rdpcap(path)
+    except Exception as e:
+        erro("cannot read pcap: " + str(e))
+        return
+    streams = OrderedDict()
+    for p in pkts:
+        if IP not in p or TCP not in p:
+            continue
+        raw = bytes(p[TCP].payload)
+        if not raw:
+            continue
+        k = (p[IP].src, p[TCP].sport, p[IP].dst, p[TCP].dport)
+        streams.setdefault(k, bytearray()).extend(raw)
+    PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+    def frames(buf, off):
+        while off + 9 <= len(buf):
+            ln = (buf[off] << 16) | (buf[off + 1] << 8) | buf[off + 2]
+            typ = buf[off + 3]; fl = buf[off + 4]
+            sid = ((buf[off + 5] << 24) | (buf[off + 6] << 16) | (buf[off + 7] << 8) | buf[off + 8]) & 0x7fffffff
+            if off + 9 + ln > len(buf):
+                break
+            yield typ, fl, sid, bytes(buf[off + 9: off + 9 + ln])
+            off += 9 + ln
+
+    def hblock(fl, pl):
+        i = 0; pad = 0
+        if fl & 0x08:
+            pad = pl[0]; i = 1
+        if fl & 0x20:
+            i += 5
+        return pl[i: len(pl) - pad if pad else len(pl)]
+
+    h1_hosts = defaultdict(int)
+    reqs = []
+    bodies_out = []
+    for k, buf in streams.items():
+        head = bytes(buf[:16])
+        if head[:4] in (b"GET ", b"POST", b"PUT ", b"HEAD", b"DELE", b"PATC", b"OPTI"):
+            txt = bytes(buf[:4000]).decode("latin1", "replace")
+            line = txt.split("\r\n", 1)[0]
+            host = ""; auth = ""
+            for ln in txt.split("\r\n"):
+                low = ln.lower()
+                if low.startswith("host:"):
+                    host = ln.split(":", 1)[1].strip(); h1_hosts[host] += 1
+                elif low.startswith("authorization:"):
+                    auth = ln.split(":", 1)[1].strip()
+            parts = line.split(" ")
+            reqs.append(("h1", parts[0] if parts else "", host, parts[1] if len(parts) > 1 else "", auth))
+            continue
+        off = len(PREFACE) if head[:len(PREFACE)] == PREFACE else 0
+        if off == 0 and not (len(buf) >= 9 and buf[3] in (0, 1, 4)):
+            continue
+        dec = Decoder()
+        pend = None
+        databuf = defaultdict(bytearray)
+        rhdrs = {}
+        for typ, fl, sid, pl in frames(buf, off):
+            try:
+                if typ == 1:
+                    blk = hblock(fl, pl)
+                    if fl & 0x04:
+                        hs = dec.decode(blk)
+                    else:
+                        pend = bytearray(blk); continue
+                elif typ == 9 and pend is not None:
+                    pend.extend(pl)
+                    if not (fl & 0x04):
+                        continue
+                    hs = dec.decode(bytes(pend)); pend = None
+                elif typ == 0:
+                    databuf[sid].extend(pl if not (fl & 0x08) else pl[1:len(pl) - pl[0]])
+                    continue
+                else:
+                    continue
+            except Exception:
+                break
+            d = {}
+            for n, v in hs:
+                if isinstance(n, bytes): n = n.decode("latin1")
+                if isinstance(v, bytes): v = v.decode("latin1", "replace")
+                d[n.lower()] = v
+            if ":method" in d or ":path" in d:
+                reqs.append(("h2", d.get(":method", ""), d.get(":authority", ""), d.get(":path", ""), d.get("authorization", "")))
+            elif ":status" in d:
+                rhdrs[sid] = d
+        if bodies:
+            for sid, body in databuf.items():
+                enc = (rhdrs.get(sid, {}).get("content-encoding", "") or "").lower()
+                raw = bytes(body)
+                try:
+                    if "gzip" in enc:
+                        raw = gzip.decompress(raw)
+                    elif "deflate" in enc:
+                        raw = zlib.decompress(raw)
+                except Exception:
+                    pass
+                bodies_out.append((rhdrs.get(sid, {}).get(":status"), raw[:800].decode("utf-8", "replace")))
+
+    def show(s):
+        return (grep is None) or (grep.lower() in (s or "").lower())
+
+    print(bold("HTTP/1.1 hosts:"))
+    for h, c in sorted(h1_hosts.items()):
+        if show(h):
+            print("  %3d  %s" % (c, h))
+    print("\n" + bold("Requests:"))
+    seen = set()
+    for proto, method, host, path, auth in reqs:
+        line = method + " " + ("https://" + host if host else "") + path
+        if line in seen or not show(host + path):
+            continue
+        seen.add(line)
+        print("  " + dim("[" + proto + "]") + " " + line[:160])
+        if auth:
+            print("       " + dim("authorization: " + (auth[:50] + "…" if len(auth) > 50 else auth)))
+    if bodies and bodies_out:
+        print("\n" + bold("Response bodies:"))
+        for st, txt in bodies_out:
+            if show(txt):
+                print("  " + dim("status " + str(st)) + "  " + txt[:300].replace("\n", " "))
+    if not h1_hosts and not reqs:
+        warn("nothing decoded (empty, or no TLS plaintext in this pcap)")
+
+
+def cmd_decodepcap(args):
+    """Decode a friTap/TLS pcap into readable HTTP (h1 + h2/HPACK + gzip)."""
+    if not os.path.isfile(args.pcap):
+        die("No such pcap: " + args.pcap)
+    hdr("Decode " + args.pcap)
+    _decode_pcap(args.pcap, grep=args.grep, bodies=args.bodies)
+
+
+def cmd_hosts(args):
+    """Enumerate the backend hosts/IPs an app contacts (no Frida; rooted ss probe).
+
+    Launches the app, polls `ss` for outbound :443 connections, reverse-resolves them,
+    and flags first-party vs known trackers. Tells 'app is cached/offline' from
+    'app genuinely isn't calling home', and finds the real API host.
+    """
+    import socket
+    serial = resolve_serial(args)
+    pkg = args.package
+    hdr("Backend hosts for " + pkg)
+    if not args.no_launch:
+        adb(["shell", "am", "force-stop", pkg], serial=serial)
+        time.sleep(1)
+        adb(["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial)
+    stop = None
+    if args.drive:
+        import threading
+        stop = threading.Event()
+        threading.Thread(target=_drive_ui, args=(serial, stop), daemon=True).start()
+    info("watching connections for ~" + str(args.duration) + "s ...")
+    ips = {}
+    t0 = time.time()
+    while time.time() - t0 < args.duration:
+        _, out, _ = adb(["shell", "su -c 'ss -tn'"], serial=serial)
+        if not out.strip():
+            _, out, _ = adb(["shell", "ss -tn"], serial=serial)
+        for m in re.finditer(r"(\d+\.\d+\.\d+\.\d+):443\b", out):
+            ip = m.group(1)
+            if ip.startswith(("10.0.2.", "127.", "0.")):
+                continue
+            ips[ip] = ips.get(ip, 0) + 1
+        time.sleep(2.5)
+    if stop:
+        stop.set()
+    if not ips:
+        warn("no outbound :443 connections seen (app idle, cached, or needs --drive)")
+        return
+    rows = []
+    for ip, c in sorted(ips.items(), key=lambda kv: -kv[1]):
+        try:
+            name = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            name = ""
+        is_tr = any(t in (name + " " + ip).lower() for t in TRACKER_HOSTS)
+        rows.append((c, ip, name, is_tr))
+    print("\n" + bold("Hosts contacted (:443):"))
+    for c, ip, name, is_tr in rows:
+        tag = dim("tracker     ") if is_tr else grn("first-party?")
+        print("  %4d  %-16s %s  %s" % (c, ip, tag, name or dim("(no PTR)")))
+    fp = [r for r in rows if not r[3]]
+    if fp:
+        print("\n" + bold("Likely first-party backends:"))
+        for c, ip, name, _ in fp:
+            print("  " + ip + ("  " + name if name else ""))
+
+
+_RASP_JS = r"""
+'use strict';
+function log(o){ send(o); }
+function exp(lib,name){ try{var m=Process.getModuleByName(lib); if(m){var e=m.findExportByName(name); if(e) return e;}}catch(_){} try{return Module.getGlobalExportByName(name);}catch(_){} return null; }
+var SUS=/frida|gum-js|gmain|linjector|magisk|xposed|substrate|superuser|27042|re\.frida|\/proc\/self\/maps|\/proc\/net\/tcp|\/su$/i;
+function hp(lib,name,idx){ var p=exp(lib,name); if(!p) return; Interceptor.attach(p,{onEnter:function(a){ try{var s=a[idx].readUtf8String(); if(s&&SUS.test(s)) log({fn:name,arg:s.slice(0,140)});}catch(e){} }}); }
+hp('libc.so','open',0); hp('libc.so','openat',1);
+['fopen','access','stat','__system_property_get'].forEach(function(n){ hp('libc.so',n,0); });
+var pt=exp('libc.so','ptrace'); if(pt) Interceptor.attach(pt,{onEnter:function(a){ log({fn:'ptrace',req:a[0].toInt32()}); }});
+var cn=exp('libc.so','connect'); if(cn) Interceptor.attach(cn,{onEnter:function(a){ try{var sa=a[1]; if(sa.readU16()===2){var port=(sa.add(2).readU8()<<8)|sa.add(3).readU8(); if(port===27042||port===27043) log({fn:'connect',port:port});}}catch(e){} }});
+log({info:'rasp recon armed'});
+"""
+
+
+def cmd_raspscan(args):
+    """Dynamic anti-instrumentation recon: hook the probes RASP uses to spot Frida/root."""
+    try:
+        import frida
+    except Exception:
+        erro("need the frida python binding:  pip install frida")
+        return
+    serial = resolve_serial(args)
+    pkg = args.package
+    hdr("RASP / Frida-detection recon: " + pkg)
+    try:
+        dev = frida.get_usb_device(timeout=10)
+        pid = dev.spawn([pkg]); sess = dev.attach(pid)
+    except Exception as e:
+        erro("spawn failed: " + str(e))
+        return
+    hits = []
+
+    def on_msg(m, d):
+        if m.get("type") == "send":
+            p = m["payload"]
+            if "info" in p:
+                info(p["info"])
+            else:
+                hits.append(p)
+                warn("probe: " + json.dumps(p, ensure_ascii=False))
+    sc = sess.create_script(_RASP_JS)
+    sc.on("message", on_msg)
+    sc.load(); dev.resume(pid)
+    info("observing startup for " + str(args.duration) + "s ...")
+    time.sleep(args.duration)
+    try:
+        sc.unload()
+    except Exception:
+        pass
+    if hits:
+        warn(str(len(hits)) + " detection probe(s) - the app actively looks for instrumentation")
+    else:
+        ok("no classic Frida/root probes at startup (open/ptrace/27042/proc-scan)")
+        print(dim("  (absence here doesn't prove no RASP - checks can be in Dart/native via raw syscalls)"))
+
+
 def cmd_batch(args):
     """Run an inspection across every app folder / apk under a directory."""
     root = args.dir or pull_dir()
@@ -3005,6 +3376,39 @@ def build_parser():
     sp.add_argument("--cold", action="store_true", help="cold boot (no snapshot)")
     sp.add_argument("--extra", help="extra raw flags passed to the emulator")
     sp.set_defaults(func=cmd_emulator)
+
+    sp = add("netfix", "fix emulator/device 'no internet' (captive-portal validation)")
+    sp.set_defaults(func=cmd_netfix)
+
+    sp = add("sslcapture", "friTap: decrypt an app's TLS to a pcap (beats pinning; Flutter-aware)")
+    sp.add_argument("package")
+    sp.add_argument("-o", "--out", help="pcap output path")
+    sp.add_argument("-d", "--duration", type=int, default=60, help="capture seconds (default 60)")
+    sp.add_argument("--attach", action="store_true", help="attach to the running app instead of spawning")
+    sp.add_argument("--drive", action="store_true", help="auto-drive the UI to generate traffic")
+    sp.add_argument("--block-quic", action="store_true", help="drop UDP/443 so an HTTP/3 first-party API falls back to TCP")
+    sp.add_argument("--stealth", action="store_true", help="friTap experimental stealth loader")
+    sp.add_argument("--decode", action="store_true", help="decode the pcap when done")
+    sp.add_argument("--bodies", action="store_true", help="with --decode: show response bodies")
+    sp.set_defaults(func=cmd_sslcapture)
+
+    sp = add("decode-pcap", "decode a friTap/TLS pcap into readable HTTP (h1 + h2/HPACK + gzip)")
+    sp.add_argument("pcap")
+    sp.add_argument("-g", "--grep", help="only show lines matching this host/path substring")
+    sp.add_argument("--bodies", action="store_true", help="also show (gzip-decoded) response bodies")
+    sp.set_defaults(func=cmd_decodepcap)
+
+    sp = add("hosts", "enumerate the backend hosts an app contacts (no Frida; rooted ss probe)")
+    sp.add_argument("package")
+    sp.add_argument("-d", "--duration", type=int, default=50, help="watch seconds (default 50)")
+    sp.add_argument("--drive", action="store_true", help="auto-drive the UI while watching")
+    sp.add_argument("--no-launch", action="store_true", help="don't (re)launch the app first")
+    sp.set_defaults(func=cmd_hosts)
+
+    sp = add("rasp-scan", "dynamic recon: what Frida/root probes an app runs (anti-instrumentation)")
+    sp.add_argument("package")
+    sp.add_argument("-d", "--duration", type=int, default=25, help="observe seconds (default 25)")
+    sp.set_defaults(func=cmd_raspscan)
 
     sp = add("batch", "run an inspection across every app under a folder")
     sp.add_argument("action", choices=["classify", "libs", "scan"], help="what to run on each")
