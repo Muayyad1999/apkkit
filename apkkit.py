@@ -69,7 +69,7 @@ import urllib.request
 import lzma
 import zipfile
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
@@ -3057,6 +3057,186 @@ def cmd_raspscan(args):
         print(dim("  (absence here doesn't prove no RASP - checks can be in Dart/native via raw syscalls)"))
 
 
+def _mitmdump_exe():
+    import shutil
+    p = shutil.which("mitmdump")
+    if p:
+        return p
+    base = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "Python")
+    if os.path.isdir(base):
+        for root, _d, files in os.walk(base):
+            if "mitmdump.exe" in files:
+                return os.path.join(root, "mitmdump.exe")
+    return None
+
+
+def _mitm_ca_der():
+    """Locate (or first-run-generate) the mitmproxy CA; return (pem_path, der_bytes)."""
+    conf = os.path.join(os.path.expanduser("~"), ".mitmproxy")
+    pem = os.path.join(conf, "mitmproxy-ca-cert.pem")
+    if not os.path.isfile(pem):
+        exe = _mitmdump_exe()
+        if not exe:
+            return None, None
+        p = subprocess.Popen([exe, "-p", "0", "--set", "confdir=" + conf],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(24):
+            if os.path.isfile(pem):
+                break
+            time.sleep(0.5)
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    if not os.path.isfile(pem):
+        return None, None
+    return pem, _der_from_cert(pem)
+
+
+def _ca_overlay_install(serial, der):
+    """Install a CA into the system trust store even when /system is read-only,
+    via a bind/tmpfs overlay of the cacerts dir. Returns (hashname, ok)."""
+    import base64
+    name = _subject_hash_old(der) + ".0"
+    pem = ("-----BEGIN CERTIFICATE-----\n" +
+           base64.encodebytes(der).decode().strip() + "\n-----END CERTIFICATE-----\n")
+    local = os.path.join(CACHE_DIR, name)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(local, "w") as f:
+        f.write(pem)
+    adb(["push", local, "/data/local/tmp/" + name], serial=serial)
+    store = "/system/etc/security/cacerts"
+    _, out, _ = adb(["shell", "ls " + store + "/" + name + " 2>/dev/null"], serial=serial)
+    if name in out:
+        return name, True
+    script = (
+        "d=" + store + "; o=/data/local/tmp/cacerts_ov; "
+        "mkdir -p $o && cp $d/* $o/ 2>/dev/null; cp /data/local/tmp/" + name + " $o/; "
+        "chmod 644 $o/*; chcon u:object_r:system_security_cacerts_file:s0 $o/* 2>/dev/null; "
+        "mount -o bind $o $d 2>/dev/null || { mount -t tmpfs tmpfs $d && cp $o/* $d/ && "
+        "chcon u:object_r:system_security_cacerts_file:s0 $d/* 2>/dev/null; }; "
+        "ls $d/" + name + " >/dev/null 2>&1 && echo OK")
+    p = subprocess.run(_su(serial, script), capture_output=True, text=True)
+    return name, ("OK" in (p.stdout or ""))
+
+
+def _print_flows(path, grep=None, bodies=False):
+    try:
+        from mitmproxy import io as _mio, http as _mhttp
+    except Exception:
+        erro("need mitmproxy to read flows:  pip install mitmproxy")
+        return
+    REDACT = ("authorization", "cookie", "set-cookie", "x-deviceid", "x-device-id", "token", "x-api-key")
+    hosts = {}
+    rows = 0
+    try:
+        f = open(path, "rb")
+    except Exception as e:
+        erro("cannot read flows: " + str(e))
+        return
+    with f:
+        for fl in _mio.FlowReader(f).stream():
+            if not isinstance(fl, _mhttp.HTTPFlow):
+                continue
+            h = fl.request.host or ""
+            u = fl.request.pretty_url.split("?")[0]
+            if grep and grep.lower() not in (u + " " + h).lower():
+                continue
+            hosts[h] = hosts.get(h, 0) + 1
+            rows += 1
+            print("  " + dim(fl.request.method) + " " + u[:150])
+            if bodies:
+                rb = (fl.request.get_text() or "").strip()
+                if rb:
+                    print("       " + dim("REQ : ") + rb[:600].replace("\n", " "))
+                if fl.response is not None:
+                    rt = (fl.response.get_text() or "").strip()
+                    print("       " + dim("RESP[" + str(fl.response.status_code) + "]: ") + rt[:500].replace("\n", " "))
+    if hosts:
+        print("\n" + bold("hosts:"))
+        for h, c in sorted(hosts.items(), key=lambda kv: -kv[1]):
+            print("  %3d  %s" % (c, h))
+    if rows == 0:
+        warn("no matching flows (empty capture, or the --grep filtered everything)")
+
+
+def cmd_capture(args):
+    """Robust TLS capture via transparent proxy (mitmproxy) - no patch, beats pinning, Flutter-proof.
+
+    Installs the mitmproxy CA into the SYSTEM trust store (bind/tmpfs overlay, works on
+    read-only /system), DNATs the device's 80/443 to mitmproxy, and blocks UDP/443 so an
+    HTTP/3 first-party channel falls back to capturable TCP. mitmproxy terminates TLS, so
+    there is NO in-process SSL hooking and NO symbol hunting. Saves + prints decrypted HTTP.
+    Rooted device required (system CA + iptables).
+    """
+    import threading
+    exe = _mitmdump_exe()
+    if not exe:
+        erro("mitmproxy not installed.")
+        print(dim("  pip install mitmproxy"))
+        return
+    serial = resolve_serial(args)
+    pkg = args.package
+    host = args.proxy_host or "10.0.2.2"      # emulator -> host
+    port = args.port
+    flows = os.path.abspath(args.out or (re.sub(r"[^A-Za-z0-9._-]+", "_", pkg) + ".flows"))
+    conf = os.path.join(os.path.expanduser("~"), ".mitmproxy")
+    hdr("Proxy TLS capture: " + pkg)
+
+    pem, der = _mitm_ca_der()
+    if not der:
+        erro("could not obtain the mitmproxy CA (run mitmdump once?)")
+        return
+    name, okca = _ca_overlay_install(serial, der)
+    (ok if okca else warn)("mitmproxy CA -> system store (" + name + ")" + ("" if okca else "  (may not have stuck - not rooted?)"))
+
+    log = flows + ".log"
+    mp = subprocess.Popen(
+        [exe, "-p", str(port), "--set", "confdir=" + conf, "--ssl-insecure", "-q",
+         "--set", "flow_detail=0", "-w", flows],
+        stdout=open(log, "w"), stderr=subprocess.STDOUT)
+    time.sleep(2)
+    for c in ("iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination " + host + ":" + str(port),
+              "iptables -t nat -A OUTPUT -p tcp --dport 80 -j DNAT --to-destination " + host + ":" + str(port),
+              "iptables -I OUTPUT -p udp --dport 443 -j DROP"):
+        subprocess.run(_su(serial, c), capture_output=True)
+    adb(["shell", "settings", "put", "global", "http_proxy", host + ":" + str(port)], serial=serial)
+    info("mitmproxy :" + str(port) + "  |  device 80/443 -> " + host + ":" + str(port) + "  |  QUIC blocked")
+
+    stop = threading.Event()
+    adb(["shell", "am", "force-stop", pkg], serial=serial)
+    time.sleep(1)
+    adb(["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial)
+    if args.drive:
+        info("auto-driving the UI")
+        threading.Thread(target=_drive_ui, args=(serial, stop), daemon=True).start()
+    info("capturing ~" + str(args.duration) + "s ... (Ctrl+C to stop early)")
+    try:
+        time.sleep(args.duration)
+    except KeyboardInterrupt:
+        print()
+    stop.set()
+
+    try:
+        mp.terminate(); mp.wait(timeout=10)
+    except Exception:
+        try: mp.kill()
+        except Exception: pass
+    # restore device networking (leave the CA; it persists until cold-boot)
+    subprocess.run(_su(serial, "iptables -t nat -F OUTPUT"), capture_output=True)
+    subprocess.run(_su(serial, "iptables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null"), capture_output=True)
+    adb(["shell", "settings", "put", "global", "http_proxy", ":0"], serial=serial)
+
+    if os.path.isfile(flows) and os.path.getsize(flows) > 64:
+        ok("flows saved: " + flows)
+        print()
+        _print_flows(flows, grep=args.grep, bodies=args.bodies)
+    else:
+        warn("no flows captured (proxy/CA/DNAT issue, or app made no requests)")
+        print(dim("  mitmdump log: " + log))
+    print(dim("  device restored (proxy/DNAT off). CA stays in the store until a cold-boot."))
+
+
 def cmd_batch(args):
     """Run an inspection across every app folder / apk under a directory."""
     root = args.dir or pull_dir()
@@ -3411,6 +3591,17 @@ def build_parser():
     sp.add_argument("package")
     sp.add_argument("-d", "--duration", type=int, default=25, help="observe seconds (default 25)")
     sp.set_defaults(func=cmd_raspscan)
+
+    sp = add("capture", "robust TLS capture via mitmproxy (no patch, beats pinning, Flutter-proof)")
+    sp.add_argument("package")
+    sp.add_argument("-o", "--out", help="flows output path")
+    sp.add_argument("-d", "--duration", type=int, default=45, help="capture seconds (default 45)")
+    sp.add_argument("-p", "--port", type=int, default=8080, help="mitmproxy port (default 8080)")
+    sp.add_argument("--proxy-host", help="host the device reaches the proxy at (default 10.0.2.2, emulator)")
+    sp.add_argument("--drive", action="store_true", help="auto-drive the UI to generate traffic")
+    sp.add_argument("-g", "--grep", help="filter decoded output by host/url substring")
+    sp.add_argument("--bodies", action="store_true", help="print request/response bodies")
+    sp.set_defaults(func=cmd_capture)
 
     sp = add("batch", "run an inspection across every app under a folder")
     sp.add_argument("action", choices=["classify", "libs", "scan"], help="what to run on each")
