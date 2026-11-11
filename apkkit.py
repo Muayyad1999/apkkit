@@ -69,7 +69,7 @@ import urllib.request
 import lzma
 import zipfile
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".apkkit.json")
@@ -1777,6 +1777,149 @@ def _plausible_ip(b):
         return all(0 <= int(p) <= 255 for p in parts) and b != b"0.0.0.0"
     except Exception:
         return False
+
+
+# --------------------------------------------------------------------------- #
+# domains + IPs extractor  (regex over every string, then filter the noise)
+# --------------------------------------------------------------------------- #
+COMMON_TLDS = frozenset((
+    "com net org io co dev app cloud ai xyz tech site online store shop fun space "
+    "me cc tv to sh ly gl st im gg fm am pw ws info biz name pro mobi asia live life "
+    "world today news media page link click email team group work digital studio "
+    "gov edu mil int aero coop jobs travel "
+    "us uk gb de fr es it nl se no fi dk pl ru ua by cn jp kr tw hk in id my sg th vn ph "
+    "pk bd lk np ir iq sa ae qa kw om bh jo lb sy ye eg ma dz tn ly ps sd so tr az ge am "
+    "ca au nz br mx ar cl pe co ve uy py bo ec za ng ke gh tz ug et sn ci cm "
+    "gr pt cz sk hu ro bg rs hr si ee lv lt is ie ch at be lu li mt cy mc"
+).split())
+
+_HOST_IN_URL = re.compile(rb"(?i)\b(?:https?|wss?|ftp)://([A-Za-z0-9.\-]+(?::\d{1,5})?)")
+_BARE_HOST   = re.compile(rb"(?i)(?<![A-Za-z0-9.@/_\-])((?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.){1,}[A-Za-z]{2,24})(?![A-Za-z0-9\-])")
+_IPV4        = re.compile(rb"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_PKG_ROOTS   = frozenset(("com org net io co cn de ru fr es it nl android androidx kotlin kotlinx "
+                          "java javax dagger okhttp3 okio retrofit2 reactivex rx squareup jetbrains "
+                          "google firebase sun apache w3 xmlpull junit material materialcomponents "
+                          "materialcalendar widget appcompat measurement lifecycle databinding class "
+                          "annotation constraintlayout recyclerview coordinatorlayout viewpager cardview").split())
+# TLDs that double as English words / code identifiers / file-ext / locale codes
+# -> the big false-positive source in bare bytecode matches (e.g. libapp.so, title.ar, view.id).
+_WORD_TLDS   = frozenset(("app today name work live life world is no am me asia fun site page link team group "
+                          "so ar at by id sk kr ee hr bo sn vn ps in ly st sh gl im gg fm ws pw to cat dad "
+                          "foo bar day year").split())
+
+
+def _norm_domain(raw, strict=True):
+    """Normalize + decide if a candidate is a real hostname (not a package/file name).
+
+    strict=True (bare matches in bytecode): also drop length-prefix fragments (digit-led
+    first label) and word-like TLDs. strict=False (hosts pulled from real URLs): trust them.
+    """
+    d = raw.lower().strip().strip(".")
+    if ":" in d:
+        d = d.split(":", 1)[0]
+    labels = d.split(".")
+    if len(labels) < 2 or any(not l for l in labels):
+        return None
+    if labels[-1] not in COMMON_TLDS:          # last label must be a real TLD
+        return None
+    if labels[0] in _PKG_ROOTS:                 # reverse-DNS package root (com.google.*), not a host
+        return None
+    if len(d) > 253:
+        return None
+    if strict:
+        if labels[0][0].isdigit():              # DEX MUTF-8 length-prefix glued to the string
+            return None
+        if labels[-1] in _WORD_TLDS:            # ...app / ...today / ...name = code, not a host
+            return None
+        if len(labels[-2]) < 2:                 # junk registrable label (a.cn, 4.bo)
+            return None
+        if any(l[0].isdigit() and len(l) <= 2 for l in labels[:-1]):  # 8.qa, 5.ar fragments
+            return None
+    return d
+
+
+def cmd_domains(args):
+    """Extract every domain + IPv4 referenced inside an APK, into a text file.
+
+    Pulls candidates by regex from all embedded strings (DEX, resources, native .so,
+    manifest, assets - UTF-8 and UTF-16), then filters the noise: keeps only hostnames
+    whose last label is a real TLD, drops reverse-DNS package roots (com.google.*, etc.).
+    """
+    z = _open_apk(args.apk)
+    hdr("Domains + IPs: " + os.path.basename(args.apk))
+    domains, ips = set(), set()
+
+    def add_host(h):
+        h = h.split(":", 1)[0]
+        if h and all(c in "0123456789." for c in h):
+            if _plausible_ip(h.encode()):
+                ips.add(h)
+        else:
+            d = _norm_domain(h, strict=False)   # pulled from a real URL -> trust it
+            if d:
+                domains.add(d)
+
+    for zi in z.infolist():
+        n = zi.filename
+        if not _interesting_for_strings(n):
+            continue
+        try:
+            data = z.read(n)
+        except Exception:
+            continue
+        for chunk in (data, _utf16_to_ascii(data)):
+            for m in _HOST_IN_URL.finditer(chunk):
+                add_host(m.group(1).decode("utf-8", "replace"))
+            for m in _BARE_HOST.finditer(chunk):
+                d = _norm_domain(m.group(1).decode("utf-8", "replace"))
+                if d:
+                    domains.add(d)
+            for m in _IPV4.finditer(chunk):
+                if _plausible_ip(m.group(0)):
+                    ips.add(m.group(0).decode())
+    z.close()
+
+    domains = sorted(domains)
+    ips = sorted(ips, key=lambda s: tuple(int(x) for x in s.split(".")))
+    resolved = {}
+    if args.resolve and domains:
+        import socket
+        info("resolving " + str(len(domains)) + " domains ...")
+        for d in domains:
+            try:
+                resolved[d] = socket.gethostbyname(d)
+            except Exception:
+                resolved[d] = ""
+
+    out = os.path.abspath(args.out or (re.sub(r"\.apk$", "", os.path.basename(args.apk)) + ".hosts.txt"))
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("# %s - %d domains, %d IPv4\n\n" % (os.path.basename(args.apk), len(domains), len(ips)))
+        f.write("[domains]\n")
+        for d in domains:
+            f.write(d + (("\t" + resolved[d]) if resolved.get(d) else "") + "\n")
+        f.write("\n[ipv4]\n")
+        for ip in ips:
+            f.write(ip + "\n")
+
+    for d in domains[: args.show]:
+        print("  " + d + (dim("  -> " + resolved[d]) if resolved.get(d) else ""))
+    if len(domains) > args.show:
+        print(dim("  ... " + str(len(domains) - args.show) + " more (in the file)"))
+    if ips:
+        print("\n" + bold("IPv4:"))
+        for ip in ips[: args.show]:
+            print("  " + ip)
+    ok("%d domains + %d IPv4 -> %s" % (len(domains), len(ips), out))
+
+
+_UTF16_RX = re.compile(rb"([\x20-\x7e])\x00")
+
+
+def _utf16_to_ascii(data):
+    """Fast UTF-16LE -> ASCII view: collapse each (printable, NUL) pair so the regexes match."""
+    if b"\x00" not in data[:8192]:
+        return b""
+    return _UTF16_RX.sub(rb"\1", data)
 
 
 def cmd_info(args):
@@ -3496,6 +3639,13 @@ def build_parser():
     sp.add_argument("-g", "--grep"); sp.add_argument("--dex", action="store_true")
     sp.add_argument("--libs", action="store_true"); sp.add_argument("--utf16", action="store_true")
     sp.add_argument("--limit", type=int, default=0); sp.set_defaults(func=cmd_strings)
+
+    sp = add("domains", "extract all domains + IPs used inside an APK to a text file")
+    sp.add_argument("apk")
+    sp.add_argument("-o", "--out", help="output text file (default <apk>.hosts.txt)")
+    sp.add_argument("--resolve", action="store_true", help="also DNS-resolve each domain to an IP")
+    sp.add_argument("--show", type=int, default=40, help="how many to print (default 40; all go to the file)")
+    sp.set_defaults(func=cmd_domains)
 
     sp = add("scan", "hunt for URLs / keys / tokens / secrets")
     sp.add_argument("apk"); sp.add_argument("--show", type=int, default=25)
